@@ -1,0 +1,20 @@
+{
+  "name": "playbook-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Personal AI memory MCP server. Local SQLite + sqlite-vec storage, local hybrid (vector + keyword) search, local embeddings, OpenRouter (free tier) for metadata extraction. Runs over MCP stdio — no network listener, no daemon.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node --env-file=.env src/server.js",
+    "init-db": "node --env-file=.env src/init-db.js"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.7.6",
+    "@modelcontextprotocol/sdk": "^1.20.1",
+    "better-sqlite3": "^12.4.1",
+    "sqlite-vec": "^0.1.9",
+    "undici": "^6.27.0",
+    "zod": "^3.25.76"
+  }
+}
