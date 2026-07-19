@@ -1,10 +1,26 @@
 import Database from "better-sqlite3";
 import * as sqliteVec from "sqlite-vec";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DB_PATH = process.env.MEMORY_DB_PATH || path.join(__dirname, "..", "data", "memory.db");
+
+// npm never includes .git in a published package, so its presence reliably
+// distinguishes "running from a git checkout" (this repo, under active
+// development) from "installed via npm/npx" (no writable/stable location
+// inside the package tree — installs can be read-only and get wiped on
+// upgrade). Checkout mode keeps the local ./data folder for dev convenience
+// (easy to find, inspect, delete); installed mode defaults to a per-user
+// home directory instead. MEMORY_DB_PATH always overrides both.
+function defaultDbPath() {
+  const isGitCheckout = fs.existsSync(path.join(__dirname, "..", ".git"));
+  if (isGitCheckout) return path.join(__dirname, "..", "data", "memory.db");
+  return path.join(os.homedir(), ".conventions-mcp", "memory.db");
+}
+
+export const DB_PATH = process.env.MEMORY_DB_PATH || defaultDbPath();
 const EMBEDDING_DIM = 384; // matches all-MiniLM-L6-v2 output
 
 let db;
@@ -12,6 +28,7 @@ let db;
 export function getDb() {
   if (db) return db;
 
+  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
   db = new Database(DB_PATH);
   sqliteVec.load(db);
   db.pragma("journal_mode = WAL");
@@ -216,6 +233,25 @@ export function listThoughts({ limit = 10, type, days } = {}) {
 
   if (type) rows = rows.filter((r) => r.metadata?.type === type);
   return rows.slice(0, limit);
+}
+
+// Every thought that applies right now: global (no project stamped) plus
+// anything stamped with the current project. Deterministic filter on the
+// `project` metadata field — no embeddings, no LLM call — so it's cheap
+// enough to call on every session start / turn without the search_thoughts
+// latency or ranking uncertainty.
+export function listRules({ project } = {}) {
+  const database = getDb();
+  const rows = database
+    .prepare(
+      `SELECT id, content, metadata, created_at FROM thoughts
+       WHERE json_extract(metadata, '$.project') IS NULL
+          OR json_extract(metadata, '$.project') = ?
+       ORDER BY created_at DESC`
+    )
+    .all(project ?? null);
+
+  return rows.map((r) => ({ ...r, metadata: JSON.parse(r.metadata) }));
 }
 
 export function thoughtStats() {

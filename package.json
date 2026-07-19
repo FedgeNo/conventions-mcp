@@ -1,13 +1,43 @@
 {
-  "name": "playbook-mcp",
+  "name": "conventions-mcp",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
-  "description": "Personal AI memory MCP server. Local SQLite + sqlite-vec storage, local hybrid (vector + keyword) search, local embeddings, OpenRouter (free tier) for metadata extraction. Runs over MCP stdio — no network listener, no daemon.",
+  "description": "Cross-session memory for coding conventions and standing instructions, so your AI coding assistant stops forgetting them between sessions. Local SQLite + embeddings, hybrid search, MCP over stdio.",
   "main": "src/server.js",
+  "bin": {
+    "conventions-mcp": "bin/cli.js"
+  },
+  "files": [
+    "src",
+    "bin",
+    ".env.example",
+    "CLAUDE.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FedgeNo/conventions-mcp.git"
+  },
+  "homepage": "https://github.com/FedgeNo/conventions-mcp",
+  "bugs": "https://github.com/FedgeNo/conventions-mcp/issues",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "memory",
+    "claude",
+    "claude-code",
+    "sqlite",
+    "vector-search",
+    "embeddings"
+  ],
+  "license": "MIT",
+  "author": "Fedge No",
+  "engines": {
+    "node": ">=20.6.0"
+  },
   "scripts": {
     "start": "node --env-file=.env src/server.js",
-    "init-db": "node --env-file=.env src/init-db.js"
+    "init-db": "node --env-file=.env src/init-db.js",
+    "check-key": "node --env-file=.env bin/check-api-key.js"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.7.6",

@@ -1,14 +1,9 @@
-// Creates data/memory.db and all tables/triggers/indexes if they don't
-// already exist. Safe to run repeatedly.
-
-import { getDb } from "./db.js";
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const dataDir = path.join(__dirname, "..", "data");
-fs.mkdirSync(dataDir, { recursive: true });
+// Creates the database (and all tables/triggers/indexes) if it doesn't
+// already exist. Safe to run repeatedly. Location is resolved by db.js
+// (MEMORY_DB_PATH override, else a checkout-vs-installed default) — this
+// stays a thin trigger so there's one source of truth for that logic.
+import "./load-env.js";
+import { getDb, DB_PATH } from "./db.js";
 
 getDb();
-console.log(`Database ready at ${path.join(dataDir, "memory.db")}`);
+console.log(`Database ready at ${DB_PATH}`);
