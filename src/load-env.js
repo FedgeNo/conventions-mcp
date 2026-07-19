@@ -7,9 +7,9 @@
 // happens to exist too.
 //
 // Import this FIRST in any entry point that reads process.env at module
-// load time (db.js's DB_PATH, metadata.js's model pools) — ES module static
-// imports evaluate in order, so a leading `import "./load-env.js"` (or
-// "../src/load-env.js" from bin/) guarantees this runs before those reads.
+// load time (db.js's DB_PATH) — ES module static imports evaluate in order,
+// so a leading `import "./load-env.js"` (or "../src/load-env.js" from bin/)
+// guarantees this runs before those reads.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";

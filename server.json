@@ -15,16 +15,7 @@
       "version": "1.0.3",
       "transport": {
         "type": "stdio"
-      },
-      "environmentVariables": [
-        {
-          "description": "OpenRouter API key, used only for the capture_thought/update_thought metadata-classification step. Free tier works. Get one at https://openrouter.ai/settings/keys",
-          "isRequired": true,
-          "format": "string",
-          "isSecret": true,
-          "name": "OPENROUTER_API_KEY"
-        }
-      ]
+      }
     }
   ]
 }
