@@ -1,10 +1,14 @@
 #!/usr/bin/env node
-// UserPromptSubmit hook: fires every turn. No hook event fires on "a rule
-// was just stated" — that's a semantic judgment only the model can make —
-// so this re-anchors two standing obligations on every turn instead: keep
-// following what session-rules.js loaded at session start (which could
-// otherwise scroll out of context on a long session), and check whether
-// this message itself just stated a new rule worth capturing.
+// UserPromptSubmit hook: fires every turn. Re-invokes list_rules on every
+// turn rather than relying on rule text loaded once at session start —
+// embedded text can scroll out of context over a long session, and (see
+// session-rules.js) a large enough rule set gets silently truncated before
+// it ever reaches the model in the first place. A tool call has neither
+// problem: it always returns the current full set, fresh, on demand.
+//
+// This also re-anchors the other standing obligation every turn: no hook
+// event fires on "the user just stated a rule" — that's a semantic
+// judgment only the model can make.
 //
 // prompt-reminder.cmd (same directory) wraps this for Windows — see the
 // note in session-rules.js for why.
@@ -13,7 +17,7 @@ process.stdout.write(
     hookSpecificOutput: {
       hookEventName: "UserPromptSubmit",
       additionalContext:
-        "Reminder: keep following the standing rules loaded from conventions-mcp memory at session start. If this message states a new coding convention, standing instruction, correction, or preference, call capture_thought now.",
+        "Call the Conventions MCP server's list_rules tool now to refresh every current standing rule (global + this project) before responding. If this message states a new coding convention, standing instruction, correction, or preference, call capture_thought too.",
     },
   })
 );

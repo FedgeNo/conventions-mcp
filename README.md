@@ -7,7 +7,7 @@ Personal memory for coding conventions and standing instructions — one store, 
 There's no shortage of memory MCP servers — several well-established ones (mem0/OpenMemory, Zep/Graphiti, the official reference memory server, plus a long tail of smaller projects) already do "remember things across sessions." What's different here:
 
 - **Narrow taxonomy, not a general note-taking store.** Every capture gets forced into one of five purpose-built types — convention, instruction, correction, preference, other — plus a scope and a project field. A general "remember anything" store gives you a pile of loosely-related notes to search through; this one is opinionated about what belongs in it at all, which keeps retrieval precise instead of noisy.
-- **Deterministic retrieval, not best-effort.** Most memory MCPs rely entirely on the calling model noticing a tool description is relevant and deciding to call it — which fails silently and inconsistently. Two Claude Code hooks here (`SessionStart`, `UserPromptSubmit`) load and re-remind about standing rules on a fixed schedule, independent of whether any given model happens to notice. If you're not on Claude Code, you still get the tool descriptions, just not the hook guarantee.
+- **Deterministic retrieval, not best-effort.** Most memory MCPs rely entirely on the calling model noticing a tool description is relevant and deciding to call it — which fails silently and inconsistently. Two Claude Code hooks here (`SessionStart`, `UserPromptSubmit`) instruct a `list_rules` call on a fixed schedule — before the model's first action, and again every turn — independent of whether any given model happens to notice on its own. If you're not on Claude Code, you still get the tool descriptions, just not the hook guarantee.
 - **Transparent by default, not silent.** Every capture and update echoes the verbatim stored content and its scope back immediately, so a misheard or misclassified rule is visible and correctable on the spot — not something you discover three sessions later via search.
 - **Fully local, zero network calls.** SQLite + local embeddings, no hosted service, no per-token costs, no API key. Classification (type/scope/topics/project) is done by the calling agent at capture time, guided by the tool description — it already has the full conversation the thought came from, richer context than an isolated content string would give a separate extractor model.
 - **Project-scoped without fuzzy matching.** A rule can be global (the default) or tied to one specific codebase, and which project it belongs to is derived from the actual git repo, not guessed by an LLM from free text — so retrieval doesn't depend on an LLM having phrased a project name consistently across captures.
@@ -86,10 +86,10 @@ Two hooks in `~/.claude/settings.json` make retrieval deterministic every sessio
 }
 ```
 
-- `bin/session-rules.js` loads every global + current-project rule into context before the model's first action each session.
-- `bin/prompt-reminder.js` fires on every turn, re-anchoring "keep following the loaded rules" and "capture this if it's a new one" — there's no hook event for "the user just stated a rule," since that's a semantic judgment only the model can make.
+- `bin/session-rules.js` instructs the model, before its first action each session, to call the `list_rules` tool — rather than embedding rule content in the hook output directly, which doesn't scale (a large enough stored rule set gets silently truncated to a small preview before it ever reaches the model).
+- `bin/prompt-reminder.js` fires on every turn, re-issuing that same `list_rules` instruction fresh (so it can't scroll out of context the way text loaded once at session start could) and re-anchoring "capture this if it's a new rule" — there's no hook event for "the user just stated a rule," since that's a semantic judgment only the model can make.
 
-Both read the current project from the session's working directory, so they work correctly regardless of where the `conventions-mcp` install itself lives on disk.
+Neither hook touches the database directly — `list_rules` itself resolves the current project from the session's working directory when the model calls it, so this works correctly regardless of where the `conventions-mcp` install itself lives on disk.
 
 **npm package:** the scripts live inside the global install rather than a known clone path — resolve it first with `npm root -g`, then point the hook at `$(npm root -g)/conventions-mcp/bin/session-rules.js` the same way.
 
