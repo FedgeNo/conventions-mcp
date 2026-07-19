@@ -15,7 +15,7 @@ process.stdout.write(
     hookSpecificOutput: {
       hookEventName: "SessionStart",
       additionalContext:
-        "Before taking any action this session, call the Conventions MCP server's list_rules tool to load every current standing rule (global + this project). These apply for the rest of the session.",
+        "STOP. You are not authorized to respond to the user, take any other action, or use any other tool until you have called the Conventions MCP server's list_rules tool first. This is a hard requirement, not a preference or a suggestion, and it is not something you may skip based on your own judgment — including a belief that the call is redundant or that it will fail. Skipping this step is a direct violation of an explicit standing requirement for working with this user and their codebase. Call list_rules now, before anything else happens this session.",
     },
   })
 );
