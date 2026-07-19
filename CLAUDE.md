@@ -150,6 +150,33 @@ Both scripts resolve "current project" via `process.cwd()` at the moment the
 hook fires, not from where the script file lives — this only works because
 hook commands inherit the active session's working directory.
 
+## Publishing a new version
+
+Two independent registries, both need bumping together — `server.json`'s
+`version` (top-level and `packages[0].version`) must exactly match
+`package.json`'s `version`, or `mcp-publisher validate` will flag the
+mismatch:
+
+1. Bump `version` in `package.json` (`mcpName` stays the same) and
+   `server.json` (both fields).
+2. `npm install --package-lock-only` to sync the lockfile, then
+   `npm publish` — the registry only stores metadata, so the npm package
+   must exist first.
+3. `mcp-publisher validate` — description is capped at 100 chars, distinct
+   from `package.json`'s own uncapped `description`.
+4. `mcp-publisher publish` — ownership is verified via `mcpName` in the
+   published npm package, so this only works *after* step 2, not before.
+
+`mcpName`/`server.json`'s `name` must match the *exact case* of the GitHub
+username the registry has on file (`io.github.FedgeNo/...`, not
+`io.github.fedgeno/...`) — the registry itself is case-sensitive here even
+though GitHub usernames aren't; `mcp-publisher login github` reports the
+permitted namespace if unsure. Aggregator directories (Smithery, mcp.so,
+PulseMCP, Glama, etc.) scrape the registry's public API on their own
+schedule rather than needing separate manual submission — see
+[`registry-aggregators.mdx`](https://github.com/modelcontextprotocol/registry/blob/main/docs/modelcontextprotocol-io/registry-aggregators.mdx)
+in the registry's own docs.
+
 ## Platform support
 
 Linux, macOS, and Windows:
