@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // SessionStart hook: loads every standing rule (global + current-project)
 // before the model takes its first action, via a direct SQL lookup — no
-// embeddings, no OpenRouter call, so this stays fast enough to run on every
+// embeddings, no network call, so this stays fast enough to run on every
 // session start without the usual capture_thought latency.
 //
 // session-rules.cmd (same directory) wraps this for Windows settings.json

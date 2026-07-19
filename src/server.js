@@ -3,9 +3,11 @@
 // network exposure of any kind. The trust boundary is simply "who can launch
 // this process," same as any other local tool.
 //
-// Pipeline: embeddings and search are fully local (SQLite + sqlite-vec +
-// FTS5, hybrid-ranked). The only network call is metadata extraction on
-// capture, via OpenRouter (free tier).
+// Pipeline is fully local: SQLite + sqlite-vec + FTS5 for storage/search,
+// a local embedding model for vectors. Classification (type/scope/topics/
+// projectSpecific) is done by the calling agent, not a separate model call —
+// it already has the full conversation the thought came from, which is
+// richer context than an isolated content string would give an extractor.
 
 import "./load-env.js";
 
@@ -14,15 +16,13 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import { embed } from "./embeddings.js";
-import { extractMetadata } from "./metadata.js";
 import { insertThought, updateThought, deleteThought, hybridSearch, listThoughts, listRules, thoughtStats } from "./db.js";
 import { getCurrentProject } from "./project.js";
 
-// The LLM only judges *whether* a thought is project-specific (metadata.projectSpecific);
+// The caller only judges *whether* a thought is project-specific (projectSpecific);
 // this stamps *which* project deterministically from cwd, replacing the boolean in
 // stored metadata so retrieval can do an exact `project` match instead of re-deriving it.
-function withProjectStamp(metadata) {
-  const { projectSpecific, ...rest } = metadata;
+function withProjectStamp({ projectSpecific, ...rest }) {
   return { ...rest, project: projectSpecific ? getCurrentProject() : null };
 }
 
@@ -30,19 +30,32 @@ function withProjectStamp(metadata) {
 // caller is expected to relay this to the user (see the tool descriptions
 // below), so a misclassification or a misheard rule is always visible and
 // correctable on the spot, not just discoverable later via search_thoughts.
-// When every OpenRouter pool attempt failed, `metadata.fallback` is true —
-// the type/scope/topics below are a placeholder, not a real classification,
-// and the caller needs to say so rather than presenting it as normal.
 function formatConfirmation(verb, id, content, metadata) {
   let confirmation = `${verb} (#${id}) as ${metadata.type}, scope: ${metadata.scope}`;
   confirmation += metadata.project ? `, project: ${metadata.project}` : " (cross-project)";
   if (metadata.topics?.length) confirmation += ` — ${metadata.topics.join(", ")}`;
-  if (metadata.fallback) {
-    confirmation += `\n\n⚠️ OpenRouter classification failed (every pool model unreachable/rate-limited) — this was saved with placeholder metadata, not a real classification. Run "npm run check-key" to check the API key, then use update_thought on #${id} to re-classify once it's working.`;
-  }
   confirmation += `\n\n"${content}"`;
   return confirmation;
 }
+
+const CLASSIFICATION_FIELDS = {
+  type: z
+    .enum(["convention", "instruction", "correction", "preference", "other"])
+    .describe(
+      "Classify using the conversation this thought came from: 'convention' — a specific coding style/pattern rule; 'instruction' — a standing directive on how to work/behave; 'correction' — a past mistake and the corrected approach; 'preference' — a softer preference, not a hard rule; 'other' — anything else that still belongs in this store."
+    ),
+  scope: z
+    .string()
+    .describe("The language, framework, or general topic this applies to (e.g. 'PHP', 'SQL', 'git') — or 'global' if it isn't tied to a particular language/framework."),
+  topics: z
+    .array(z.string())
+    .min(1)
+    .max(3)
+    .describe("1-3 short topic tags (e.g. 'git', 'testing', 'naming')."),
+  projectSpecific: z
+    .boolean()
+    .describe("True ONLY if this explicitly names one project/codebase or is obviously about its specific files/architecture — false (the default assumption) for anything that could apply across projects."),
+};
 
 const server = new McpServer({ name: "conventions-mcp", version: "1.0.0" });
 
@@ -51,17 +64,18 @@ server.registerTool(
   {
     title: "Capture Convention or Instruction",
     description:
-      "Save a coding convention, standing instruction, correction, or workflow preference for future reference — e.g. style rules ('always use 2-space indent'), standing directives ('never force-push to main'), a correction after getting something wrong, or a stated preference for how work should be done. Call this whenever the user states a rule or preference for how you should work, corrects your approach, or explicitly asks you to remember something — don't wait to be asked to 'save' it. Occasional non-coding notes are fine too, but this store is primarily for conventions and instructions that should carry across future sessions and projects. If a single message states multiple distinct rules, call this once per rule — don't merge them into one capture — and relay each one individually the same as a single capture, not summarized together. After every successful call, state the captured content verbatim and its scope back to the user (the response text already contains both) — this is how they catch a misinterpreted rule and correct or delete it immediately, rather than discovering it wrong much later. If the response includes a ⚠️ fallback-classification warning, relay that warning too, plainly — the metadata shown is a placeholder, not real, until re-classified.",
+      "Save a coding convention, standing instruction, correction, or workflow preference for future reference — e.g. style rules ('always use 2-space indent'), standing directives ('never force-push to main'), a correction after getting something wrong, or a stated preference for how work should be done. Call this whenever the user states a rule or preference for how you should work, corrects your approach, or explicitly asks you to remember something — don't wait to be asked to 'save' it. Occasional non-coding notes are fine too, but this store is primarily for conventions and instructions that should carry across future sessions and projects. Classify it yourself using the type/scope/topics/projectSpecific fields below, based on the conversation the thought came from. If a single message states multiple distinct rules, call this once per rule — don't merge them into one capture — and relay each one individually the same as a single capture, not summarized together. After every successful call, state the captured content verbatim and its scope back to the user (the response text already contains both) — this is how they catch a misinterpreted rule and correct or delete it immediately, rather than discovering it wrong much later.",
     inputSchema: {
       content: z
         .string()
         .describe("The convention, instruction, or thought to capture — a clear, standalone statement that will make sense when retrieved later, in a different session, with no other context"),
+      ...CLASSIFICATION_FIELDS,
     },
   },
-  async ({ content }) => {
+  async ({ content, type, scope, topics, projectSpecific }) => {
     try {
-      const [embedding, extracted] = await Promise.all([embed(content), extractMetadata(content)]);
-      const metadata = withProjectStamp(extracted);
+      const embedding = await embed(content);
+      const metadata = withProjectStamp({ type, scope, topics, projectSpecific });
       const id = insertThought({ content, metadata, embedding });
       return { content: [{ type: "text", text: formatConfirmation("Captured", id, content, metadata) }] };
     } catch (err) {
@@ -75,18 +89,19 @@ server.registerTool(
   {
     title: "Update a Captured Thought",
     description:
-      "Correct or refine an existing thought's content in place — same id, same capture date, re-embedded and re-tagged from the new content. Use this instead of delete_thought + capture_thought whenever the user is correcting, refining, or replacing what a specific existing thought says (a stale convention, a preference that's since changed) rather than adding an unrelated new one. If the id isn't already known from context, use search_thoughts or list_thoughts first and confirm with the user which one before updating. After a successful call, state the updated content verbatim and its scope back to the user (the response text already contains both) — this is how they catch a misinterpreted rule and correct or delete it immediately. If the response includes a ⚠️ fallback-classification warning, relay that warning too, plainly — the metadata shown is a placeholder, not real, until re-classified.",
+      "Correct or refine an existing thought's content in place — same id, same capture date, re-embedded and re-tagged from the new content. Use this instead of delete_thought + capture_thought whenever the user is correcting, refining, or replacing what a specific existing thought says (a stale convention, a preference that's since changed) rather than adding an unrelated new one. If the id isn't already known from context, use search_thoughts or list_thoughts first and confirm with the user which one before updating. Re-classify using the type/scope/topics/projectSpecific fields below, based on the corrected content and the conversation it came from. After a successful call, state the updated content verbatim and its scope back to the user (the response text already contains both) — this is how they catch a misinterpreted rule and correct or delete it immediately.",
     inputSchema: {
       id: z.number().describe("The numeric ID of the thought to update, as shown in search_thoughts/list_thoughts output (e.g. the '#4' in a result)"),
       content: z
         .string()
         .describe("The corrected/replacement content — a clear, standalone statement, same as capture_thought"),
+      ...CLASSIFICATION_FIELDS,
     },
   },
-  async ({ id, content }) => {
+  async ({ id, content, type, scope, topics, projectSpecific }) => {
     try {
-      const [embedding, extracted] = await Promise.all([embed(content), extractMetadata(content)]);
-      const metadata = withProjectStamp(extracted);
+      const embedding = await embed(content);
+      const metadata = withProjectStamp({ type, scope, topics, projectSpecific });
       const updated = updateThought(id, { content, metadata, embedding });
       if (!updated) {
         return { content: [{ type: "text", text: `No thought found with id #${id} — nothing updated.` }] };
