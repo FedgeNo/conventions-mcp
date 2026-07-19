@@ -41,18 +41,19 @@ the server's own code, plus how to wire the finished server into a client.
   step and no network call anywhere in the capture pipeline.
 - `db.js`'s `listRules({ project })` — a plain deterministic SQL filter
   (`project IS NULL OR project = ?`), no embeddings, no LLM call. Backs the
-  `list_rules` MCP tool and both hook scripts in `bin/` — cheap enough to run
-  on every session start / every turn.
+  `list_rules` MCP tool — cheap enough to call on every turn.
 - `bin/session-rules.js` (`SessionStart` hook) and `bin/prompt-reminder.js`
-  (`UserPromptSubmit` hook) — see "Standing-rule hooks" below. These call
-  `listRules`/`getCurrentProject` directly via relative import, bypassing the
-  MCP transport entirely, because hooks are shell commands the harness
-  invokes directly, not tool calls the model makes. Each has a `.cmd`
+  (`UserPromptSubmit` hook) — see "Standing-rule hooks" below. Neither
+  touches the database directly; each emits a short, fixed-size instruction
+  telling the model to call the `list_rules` MCP tool itself. Embedding the
+  rule content directly in hook output doesn't scale — a large enough stored
+  rule set gets silently truncated to a small preview before it ever reaches
+  the model, and text loaded once at session start can scroll out of context
+  over a long session anyway. A tool call the model actually makes has
+  neither problem: no size ceiling on the response, and it's re-issued fresh
+  every turn via the `UserPromptSubmit` hook. Each script has a `.cmd`
   sibling (`session-rules.cmd`, `prompt-reminder.cmd`) that Windows
-  `settings.json` entries point at — see "Platform support" below. Every path
-  in `src/` goes through `node:path`, which is cross-platform by design, and
-  the one process-spawn (`execFileSync("git", ...)` in `project.js`) resolves
-  via Node's own PATH/PATHEXT search on every OS.
+  `settings.json` entries point at — see "Platform support" below.
 - `src/server.js` — registers the seven MCP tools (`capture_thought`,
   `update_thought`, `delete_thought`, `search_thoughts`, `list_thoughts`,
   `list_rules`, `thought_stats`) and connects over stdio. `update_thought` is
@@ -68,8 +69,8 @@ the server's own code, plus how to wire the finished server into a client.
 - `src/project.js` — `getCurrentProject()` derives a stable project identifier
   from the git repo's toplevel directory name (falls back to plain `cwd`
   basename outside a git repo). Used to stamp captures and to filter
-  `list_rules`/the hook scripts, so "which project" is a deterministic lookup
-  rather than free-text matching against whatever string an LLM happened to
+  `list_rules`, so "which project" is a deterministic lookup rather than
+  free-text matching against whatever string an LLM happened to
   write.
 - `bin/cli.js` — the npm `"bin"` entry (`package.json`'s
   `"bin": { "conventions-mcp": "bin/cli.js" }`), so an installed copy resolves
@@ -119,22 +120,24 @@ Two hooks, configured in `~/.claude/settings.json` (not this repo — see
 retrieval every session — hook events fire deterministically regardless of
 whether a given model happens to notice relevance in the moment:
 
-- **`SessionStart`** → `bin/session-rules.js` — loads every applicable rule
-  (global + current-project) into context *before* the model's first action,
-  via `listRules`. No embeddings, no network call, so it's fast enough to run
-  on every session start unconditionally.
-- **`UserPromptSubmit`** → `bin/prompt-reminder.js` — fires on every turn. No
-  hook event exists for "the user just stated a rule" — that's a semantic
-  judgment only the model can make, and hook `prompt`/`agent` types (which
-  *can* run an LLM check) are restricted to tool events, not this one. So this
-  hook re-anchors two things every turn instead: keep following what
-  `SessionStart` loaded (which could otherwise scroll out of context in a long
-  session) and check whether the message just stated a new rule worth a
-  `capture_thought` call.
+- **`SessionStart`** → `bin/session-rules.js` — instructs the model, *before
+  its first action*, to call the `list_rules` tool. Neither hook touches the
+  database directly (removed — see below); embedding rule content directly
+  in hook output doesn't scale, since a large enough stored rule set gets
+  silently truncated to a small preview before it ever reaches the model.
+- **`UserPromptSubmit`** → `bin/prompt-reminder.js` — fires on every turn,
+  re-issuing the same `list_rules` instruction fresh every time (so it can't
+  scroll out of context the way text loaded once at session start could),
+  plus a second obligation: no hook event exists for "the user just stated a
+  rule" — that's a semantic judgment only the model can make, and hook
+  `prompt`/`agent` types (which *can* run an LLM check) are restricted to
+  tool events, not this one — so this hook also re-anchors "call
+  `capture_thought` if this message just stated a new one."
 
-Both scripts resolve "current project" via `process.cwd()` at the moment the
-hook fires, not from where the script file lives — this only works because
-hook commands inherit the active session's working directory.
+Both scripts are now static — no database access, no `getCurrentProject`
+call. `list_rules` itself resolves "current project" via `process.cwd()`
+when the model actually calls it, which works because the tool call runs in
+the same process as the active session and inherits its working directory.
 
 ## Platform support
 
