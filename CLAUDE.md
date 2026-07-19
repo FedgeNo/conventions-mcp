@@ -86,25 +86,19 @@ documents for a human, written here as direct steps for an agent to execute:
    https://openrouter.ai/settings/keys — free tier works with the default
    model pool). Never fill in or guess an API key yourself.
 2. Run `npm run init-db` to create `data/memory.db`.
-3. Register the server globally in `~/.claude/settings.json` under
-   `mcpServers`, using **absolute paths** for both the `--env-file` and the
-   server script — Claude Code can spawn this from an arbitrary working
-   directory, so a relative `.env` path silently fails to resolve:
-   ```json
-   {
-     "mcpServers": {
-       "playbook": {
-         "command": "node",
-         "args": [
-           "--env-file=/absolute/path/to/playbook-mcp/.env",
-           "/absolute/path/to/playbook-mcp/src/server.js"
-         ]
-       }
-     }
-   }
+3. Register the server at user scope with the `claude mcp add` CLI command,
+   using **absolute paths** for both the `--env-file` and the server script
+   — Claude Code can spawn this from an arbitrary working directory, so a
+   relative `.env` path silently fails to resolve:
+   ```bash
+   claude mcp add --scope user playbook -- node --env-file=/absolute/path/to/playbook-mcp/.env /absolute/path/to/playbook-mcp/src/server.js
    ```
-   Merge this into the existing `mcpServers` object rather than overwriting
-   it — other MCP servers may already be registered there.
+   This writes the registration to `~/.claude.json`'s top-level `mcpServers`
+   key, which is the file the CLI actually reads. `~/.claude/settings.json`
+   has a `mcpServers` key too, but Claude Code's CLI does not read it —
+   entries placed there are silently inert (confirmed via `claude mcp list`
+   not showing them). Verify the registration took with `claude mcp list`,
+   not by inspecting a config file.
 4. Tell the user a **new Claude Code session** is required to pick up a
    newly-registered MCP server — tools registered mid-session aren't visible
    to the running session that just edited the config.
