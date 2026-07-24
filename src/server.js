@@ -4,8 +4,8 @@
 // this process," same as any other local tool.
 //
 // Pipeline is fully local: SQLite + sqlite-vec + FTS5 for storage/search,
-// a local embedding model for vectors. Classification (type/scope/topics/
-// projectSpecific) is done by the calling agent, not a separate model call —
+// a local embedding model for vectors. Classification (type/topics/
+// projectScoped) is done by the calling agent, not a separate model call —
 // it already has the full conversation the thought came from, which is
 // richer context than an isolated content string would give an extractor.
 
@@ -19,11 +19,12 @@ import { embed } from "./embeddings.js";
 import { insertThought, updateThought, deleteThought, hybridSearch, listThoughts, listRules, thoughtStats } from "./db.js";
 import { getCurrentProject } from "./project.js";
 
-// The caller only judges *whether* a thought is project-specific (projectSpecific);
-// this stamps *which* project deterministically from cwd, replacing the boolean in
-// stored metadata so retrieval can do an exact `project` match instead of re-deriving it.
-function withProjectStamp({ projectSpecific, ...rest }) {
-  return { ...rest, project: projectSpecific ? getCurrentProject() : null };
+// The caller only judges *whether* a thought is scoped to the current project
+// (projectScoped); this stamps *which* project deterministically from cwd,
+// replacing the boolean in stored metadata so retrieval can do an exact
+// `project` match instead of re-deriving it.
+function withProjectStamp({ projectScoped, ...rest }) {
+  return { ...rest, project: projectScoped ? getCurrentProject() : null };
 }
 
 // Echoes the verbatim content back alongside the classification — the
@@ -31,8 +32,8 @@ function withProjectStamp({ projectSpecific, ...rest }) {
 // below), so a misclassification or a misheard rule is always visible and
 // correctable on the spot, not just discoverable later via search_thoughts.
 function formatConfirmation(verb, id, content, metadata) {
-  let confirmation = `${verb} (#${id}) as ${metadata.type}, scope: ${metadata.scope}`;
-  confirmation += metadata.project ? `, project: ${metadata.project}` : " (cross-project)";
+  let confirmation = `${verb} (#${id}) as ${metadata.type}`;
+  confirmation += metadata.project ? `, project: ${metadata.project}` : " (global)";
   if (metadata.topics?.length) confirmation += ` — ${metadata.topics.join(", ")}`;
   confirmation += `\n\n"${content}"`;
   return confirmation;
@@ -44,17 +45,14 @@ const CLASSIFICATION_FIELDS = {
     .describe(
       "Classify using the conversation this thought came from: 'convention' — a specific coding style/pattern rule; 'instruction' — a standing directive on how to work/behave; 'correction' — a past mistake and the corrected approach; 'preference' — a softer preference, not a hard rule; 'other' — anything else that still belongs in this store."
     ),
-  scope: z
-    .string()
-    .describe("The language, framework, or general topic this applies to (e.g. 'PHP', 'SQL', 'git') — or 'global' if it isn't tied to a particular language/framework."),
   topics: z
     .array(z.string())
     .min(1)
     .max(3)
     .describe("1-3 short topic tags (e.g. 'git', 'testing', 'naming')."),
-  projectSpecific: z
+  projectScoped: z
     .boolean()
-    .describe("True ONLY if this explicitly names one project/codebase or is obviously about its specific files/architecture — false (the default assumption) for anything that could apply across projects."),
+    .describe("True ONLY if this rule is specific to the current project/working directory — false (the default) for anything that applies across projects. When true the server stamps the current project id automatically; global rules leave it empty."),
 };
 
 const server = new McpServer({ name: "conventions-mcp", version: "1.0.0" });
@@ -64,18 +62,20 @@ server.registerTool(
   {
     title: "Capture Convention or Instruction",
     description:
-      "Save a coding convention, standing instruction, correction, or workflow preference for future reference — e.g. style rules ('always use 2-space indent'), standing directives ('never force-push to main'), a correction after getting something wrong, or a stated preference for how work should be done. Call this whenever the user states a rule or preference for how you should work, corrects your approach, or explicitly asks you to remember something — don't wait to be asked to 'save' it. Occasional non-coding notes are fine too, but this store is primarily for conventions and instructions that should carry across future sessions and projects. Classify it yourself using the type/scope/topics/projectSpecific fields below, based on the conversation the thought came from. If a single message states multiple distinct rules, call this once per rule — don't merge them into one capture — and relay each one individually the same as a single capture, not summarized together. After every successful call, state the captured content verbatim and its scope back to the user (the response text already contains both) — this is how they catch a misinterpreted rule and correct or delete it immediately, rather than discovering it wrong much later.",
+      "Save a coding convention, standing instruction, correction, or workflow preference for future reference — e.g. style rules ('always use 2-space indent'), standing directives ('never force-push to main'), a correction after getting something wrong, or a stated preference for how work should be done. Condense each rule to one sentence, two if absolutely necessary — no incident stories, user quotes, or example code. Call this whenever the user states a rule or preference for how you should work, corrects your approach, or explicitly asks you to remember something — don't wait to be asked to 'save' it. Classify it yourself using the type/topics/projectScoped fields below, based on the conversation the thought came from. If a single message states multiple distinct rules, call this once per rule — don't merge them into one capture — and relay each one individually the same as a single capture, not summarized together. After every successful call, state the captured content verbatim and its project back to the user (the response text already contains both) — this is how they catch a misinterpreted rule and correct or delete it immediately, rather than discovering it wrong much later.",
     inputSchema: {
       content: z
         .string()
-        .describe("The convention, instruction, or thought to capture — a clear, standalone statement that will make sense when retrieved later, in a different session, with no other context"),
+        .describe(
+          "The rule itself, condensed to one sentence — two only if absolutely necessary to convey the gist. Do NOT include the incident it came from, the user's words, before/after stories, or example files/identifiers — that padding wastes space without improving retrieval. Example: 'Never assign innerHTML; build with DOM methods.' (not 'I once had an XSS bug when I…')"
+        ),
       ...CLASSIFICATION_FIELDS,
     },
   },
-  async ({ content, type, scope, topics, projectSpecific }) => {
+  async ({ content, type, topics, projectScoped }) => {
     try {
       const embedding = await embed(content);
-      const metadata = withProjectStamp({ type, scope, topics, projectSpecific });
+      const metadata = withProjectStamp({ type, topics, projectScoped });
       const id = insertThought({ content, metadata, embedding });
       return { content: [{ type: "text", text: formatConfirmation("Captured", id, content, metadata) }] };
     } catch (err) {
@@ -89,19 +89,19 @@ server.registerTool(
   {
     title: "Update a Captured Thought",
     description:
-      "Correct or refine an existing thought's content in place — same id, same capture date, re-embedded and re-tagged from the new content. Use this instead of delete_thought + capture_thought whenever the user is correcting, refining, or replacing what a specific existing thought says (a stale convention, a preference that's since changed) rather than adding an unrelated new one. If the id isn't already known from context, use search_thoughts or list_thoughts first and confirm with the user which one before updating. Re-classify using the type/scope/topics/projectSpecific fields below, based on the corrected content and the conversation it came from. After a successful call, state the updated content verbatim and its scope back to the user (the response text already contains both) — this is how they catch a misinterpreted rule and correct or delete it immediately.",
+      "Correct or refine an existing thought's content in place — same id, re-embedded and re-tagged from the new content. Condense the rule to one sentence, two if absolutely necessary — no incident stories, user quotes, or example code. Use this instead of delete_thought + capture_thought whenever the user is correcting, refining, or replacing what a specific existing thought says (a stale convention, a preference that's since changed) rather than adding an unrelated new one. If the id isn't already known from context, use search_thoughts or list_thoughts first and confirm with the user which one before updating. Re-classify using the type/topics/projectScoped fields below, based on the corrected content and the conversation it came from. After a successful call, state the updated content verbatim and its project back to the user (the response text already contains both) — this is how they catch a misinterpreted rule and correct or delete it immediately.",
     inputSchema: {
       id: z.number().describe("The numeric ID of the thought to update, as shown in search_thoughts/list_thoughts output (e.g. the '#4' in a result)"),
       content: z
         .string()
-        .describe("The corrected/replacement content — a clear, standalone statement, same as capture_thought"),
+        .describe("The corrected/replacement content — condensed to one sentence, two if absolutely necessary, with no padding from the incident/user's words/example files — same as capture_thought"),
       ...CLASSIFICATION_FIELDS,
     },
   },
-  async ({ id, content, type, scope, topics, projectSpecific }) => {
+  async ({ id, content, type, topics, projectScoped }) => {
     try {
       const embedding = await embed(content);
-      const metadata = withProjectStamp({ type, scope, topics, projectSpecific });
+      const metadata = withProjectStamp({ type, topics, projectScoped });
       const updated = updateThought(id, { content, metadata, embedding });
       if (!updated) {
         return { content: [{ type: "text", text: `No thought found with id #${id} — nothing updated.` }] };
@@ -161,8 +161,7 @@ server.registerTool(
           const m = t.metadata || {};
           const parts = [
             `--- Result ${i + 1} (#${t.id}) ---`,
-            `Captured: ${new Date(t.created_at).toLocaleDateString()}`,
-            `Type: ${m.type || "unknown"}${m.scope ? `, scope: ${m.scope}` : ""}`,
+            `Type: ${m.type || "unknown"}${m.project ? `, project: ${m.project}` : ""}`,
           ];
           if (m.topics?.length) parts.push(`Topics: ${m.topics.join(", ")}`);
           parts.push(`\n${t.content}`);
@@ -180,30 +179,28 @@ server.registerTool(
 server.registerTool(
   "list_thoughts",
   {
-    title: "List Recent Conventions and Instructions",
-    description: "List recently captured conventions/instructions, optionally filtered by type or time range.",
+    title: "List Conventions and Instructions",
+    description: "List all captured conventions/instructions, optionally filtered by type.",
     inputSchema: {
-      limit: z.number().optional().default(10),
       type: z
         .enum(["convention", "instruction", "correction", "preference", "other"])
         .optional(),
-      days: z.number().optional().describe("Only thoughts from the last N days"),
     },
   },
-  async ({ limit, type, days }) => {
+  async ({ type }) => {
     try {
-      const rows = listThoughts({ limit, type, days });
+      const rows = listThoughts({ type });
       if (!rows.length) return { content: [{ type: "text", text: "No thoughts found." }] };
 
       const text = rows
-        .map((t, i) => {
+        .map((t) => {
           const m = t.metadata || {};
           const tags = m.topics?.length ? " - " + m.topics.join(", ") : "";
-          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${tags})\n   ${t.content}`;
+          return `#${t.id} (${m.type || "??"}${tags})\n   ${t.content}`;
         })
         .join("\n\n");
 
-      return { content: [{ type: "text", text: `${rows.length} recent thought(s):\n\n${text}` }] };
+      return { content: [{ type: "text", text: `${rows.length} thought(s):\n\n${text}` }] };
     } catch (err) {
       return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
     }
@@ -225,11 +222,11 @@ server.registerTool(
       if (!rows.length) return { content: [{ type: "text", text: "No rules found." }] };
 
       const text = rows
-        .map((t, i) => {
+        .map((t) => {
           const m = t.metadata || {};
           const tags = m.topics?.length ? " - " + m.topics.join(", ") : "";
-          const scope = m.project ? `, project: ${m.project}` : ", global";
-          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${scope}${tags})\n   ${t.content}`;
+          const projectLabel = m.project ? `, project: ${m.project}` : ", global";
+          return `#${t.id} (${m.type || "??"}${projectLabel}${tags})\n   ${t.content}`;
         })
         .join("\n\n");
 
@@ -244,7 +241,7 @@ server.registerTool(
   "thought_stats",
   {
     title: "Thought Statistics",
-    description: "Get a summary of everything captured: totals, types, top topics, and scopes (which languages/projects/contexts have the most stored conventions).",
+    description: "Get a summary of everything captured: totals, types, top topics, and per-project counts.",
     inputSchema: {},
   },
   async () => {
@@ -257,9 +254,6 @@ server.registerTool(
 
       const lines = [
         `Total thoughts: ${stats.total}`,
-        stats.dateRange
-          ? `Date range: ${new Date(stats.dateRange.from).toLocaleDateString()} → ${new Date(stats.dateRange.to).toLocaleDateString()}`
-          : null,
         "",
         "Types:",
         ...sortTop(stats.types).map(([k, v]) => `  ${k}: ${v}`),
@@ -269,9 +263,9 @@ server.registerTool(
         lines.push("", "Top topics:");
         for (const [k, v] of sortTop(stats.topics)) lines.push(`  ${k}: ${v}`);
       }
-      if (Object.keys(stats.scopes).length) {
-        lines.push("", "By scope:");
-        for (const [k, v] of sortTop(stats.scopes)) lines.push(`  ${k}: ${v}`);
+      if (Object.keys(stats.projects).length) {
+        lines.push("", "By project:");
+        for (const [k, v] of sortTop(stats.projects)) lines.push(`  ${k}: ${v}`);
       }
 
       return { content: [{ type: "text", text: lines.join("\n") }] };

@@ -1,14 +1,17 @@
 #!/usr/bin/env node
-// PreToolUse hook (matcher "*"): fires before every tool call. If the model
-// reaches for any tool other than list_rules without having called
-// list_rules yet this turn, this denies the call outright — a real block,
-// not another ignorable reminder, since UserPromptSubmit's text-only
-// instruction has repeatedly gone unfollowed in practice.
+// PreToolUse hook (matcher "*"): the enforcement backstop for the "load the
+// rules" directive that session-rules.js issues at session start. If the
+// model reaches for any tool other than list_rules before it has loaded the
+// rules, this denies the call outright — a real block, not another ignorable
+// reminder, since a text-only directive can go unfollowed.
 //
-// Hooks are stateless shell invocations with no memory of their own, so
-// "already called this turn" is tracked via a marker file per session:
-// prompt-reminder.js clears it at the start of every turn, and this script
-// sets it the moment it sees a list_rules call go by.
+// "Already loaded" is tracked via a per-session marker file (hooks are
+// stateless, with no memory of their own): this script writes the marker the
+// moment it sees a list_rules call go by, and session-rules.js removes it at
+// the boundaries where the loaded rules leave context — after compaction and
+// after /clear — so the model is forced to reload before its next tool use.
+// Between those boundaries the marker persists, so list_rules is forced once,
+// not once per turn.
 //
 // pre-tool-check.cmd (same directory) wraps this for Windows — see the note
 // in session-rules.js for why.

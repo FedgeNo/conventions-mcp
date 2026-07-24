@@ -6,11 +6,11 @@ Personal memory for coding conventions and standing instructions — one store, 
 
 There's no shortage of memory MCP servers — several well-established ones (mem0/OpenMemory, Zep/Graphiti, the official reference memory server, plus a long tail of smaller projects) already do "remember things across sessions." What's different here:
 
-- **Narrow taxonomy, not a general note-taking store.** Every capture gets forced into one of five purpose-built types — convention, instruction, correction, preference, other — plus a scope and a project field. A general "remember anything" store gives you a pile of loosely-related notes to search through; this one is opinionated about what belongs in it at all, which keeps retrieval precise instead of noisy.
-- **Deterministic retrieval, not best-effort.** Most memory MCPs rely entirely on the calling model noticing a tool description is relevant and deciding to call it — which fails silently and inconsistently. Three Claude Code hooks here (`SessionStart`, `UserPromptSubmit`, `PreToolUse`) instruct a `list_rules` call on a fixed schedule — before the model's first action, and again every turn — and the last one actually enforces it by denying other tool calls until `list_rules` has been attempted that turn, rather than just repeating the request. If you're not on Claude Code, you still get the tool descriptions, just not the hook guarantee.
-- **Transparent by default, not silent.** Every capture and update echoes the verbatim stored content and its scope back immediately, so a misheard or misclassified rule is visible and correctable on the spot — not something you discover three sessions later via search.
-- **Fully local, zero network calls.** SQLite + local embeddings, no hosted service, no per-token costs, no API key. Classification (type/scope/topics/project) is done by the calling agent at capture time, guided by the tool description — it already has the full conversation the thought came from, richer context than an isolated content string would give a separate extractor model.
-- **Project-scoped without fuzzy matching.** A rule can be global (the default) or tied to one specific codebase, and which project it belongs to is derived from the actual git repo, not guessed by an LLM from free text — so retrieval doesn't depend on an LLM having phrased a project name consistently across captures.
+- **Narrow taxonomy, not a general note-taking store.** Every capture gets forced into one of five purpose-built types — convention, instruction, correction, preference, other — plus a project field and topic tags. A general "remember anything" store gives you a pile of loosely-related notes to search through; this one is opinionated about what belongs in it at all, which keeps retrieval precise instead of noisy.
+- **Deterministic retrieval, not best-effort.** Most memory MCPs rely entirely on the calling model noticing a tool description is relevant and deciding to call it — which fails silently and inconsistently. Three Claude Code hooks here (`SessionStart`, `UserPromptSubmit`, `PreToolUse`) make a `list_rules` call unavoidable — the first two are advisory reminders, and the third actually enforces it by denying every other tool call until `list_rules` has run. It's forced once per session (and re-armed after a compaction or `/clear`, when the loaded rules fall out of context), not once per turn. If you're not on Claude Code, you still get the tool descriptions, just not the hook guarantee.
+- **Transparent by default, not silent.** Every capture and update echoes the verbatim stored content and whether it's global or project-scoped back immediately, so a misheard or misclassified rule is visible and correctable on the spot — not something you discover three sessions later via search.
+- **Fully local, zero network calls.** SQLite + local embeddings, no hosted service, no per-token costs, no API key. Classification (type/topics/projectScoped) is done by the calling agent at capture time, guided by the tool description — it already has the full conversation the thought came from, richer context than an isolated content string would give a separate extractor model.
+- **Project-scoped without fuzzy matching.** A rule can be global (the default) or tied to one specific codebase, and which project it belongs to is derived deterministically from the working directory, not guessed by an LLM from free text — so retrieval doesn't depend on an LLM having phrased a project name consistently across captures.
 
 If what you want is a general-purpose "remember everything" store, or you're not on Claude Code and don't need the hook-driven determinism, one of the more general options above may fit better. This one is for someone who specifically wants a tight, coding-convention-focused memory that stays accurate and doesn't require trusting the model to remember to check it.
 
@@ -26,15 +26,15 @@ Every capture is classified into one of five types by the calling agent, guided 
 | `preference` | A softer preference, not a hard rule |
 | `other` | Catch-all for anything that doesn't fit but still got captured |
 
-Each thought also gets a **scope** (a language/framework/topic, or `"global"`) and 1–3 **topic tags** for filtering. This is deliberately narrow — it's not a general note-taking store — but the taxonomy isn't hardcoded logic, it's just the wording of the tool description and its zod schema in `src/server.js`. Retuning what counts as a `convention` vs. an `instruction`, adding a new type, or changing what "scope" means is a matter of editing that description text, not restructuring the code. The one wrinkle: the five type names are also referenced in the `type` filter's enum in `list_thoughts` (`src/server.js`) — if you rename or add a type, update that enum too or the new type will get rejected as a filter value. Everything's stored as a JSON blob column, so none of this needs a schema migration.
+Each thought also gets 1–3 **topic tags** for filtering. This is deliberately narrow — it's not a general note-taking store — but the taxonomy isn't hardcoded logic, it's just the wording of the tool description and its zod schema in `src/server.js`. Retuning what counts as a `convention` vs. an `instruction`, or adding a new type, is a matter of editing that description text, not restructuring the code. The one wrinkle: the five type names are also referenced in the `type` filter's enum in `list_thoughts` (`src/server.js`) — if you rename or add a type, update that enum too or the new type will get rejected as a filter value. Everything's stored as a JSON blob column, so none of this needs a schema migration.
 
-Separately, every thought gets a **project** field — `null` by default (applies everywhere), or a specific project name if it's obviously scoped to one codebase. The calling agent only judges *whether* it's project-specific; the actual project name is derived deterministically from the current git repo's directory name, not guessed by the model — so retrieval can do an exact match instead of fuzzy text comparison.
+Separately, every thought gets a **project** field — `null` by default (applies everywhere), or a specific project id if it's scoped to the current codebase. The calling agent only judges *whether* it's project-scoped (`projectScoped`); the actual project id is derived deterministically from the working directory — the absolute path with separators turned into dashes, e.g. `/var/www/html` → `-var-www-html`, matching the per-project directory name Claude Code itself uses under `~/.claude/projects/`. The model never names the project, so retrieval can do an exact match instead of fuzzy text comparison.
 
 - **Storage:** SQLite (`better-sqlite3`) + `sqlite-vec` for native vector search, FTS5 for keyword search, combined via reciprocal rank fusion. One file, no server, no daemon.
 - **Embeddings:** local, via `Xenova/bge-small-en-v1.5` (384-dim, quantized, ~130MB). Loads lazily on first use, no network call, no GPU needed.
 - **Classification:** done by the calling agent (Claude Code, or any MCP client) at capture time, guided by the tool description — no network call, no external model, no API key.
 - **Transport:** MCP over stdio. No port, no listener, no CORS, no shared secret — the trust boundary is simply "who can launch this process," same as any other local tool.
-- **Proactive retrieval:** two Claude Code hooks (see below) load and re-remind about standing rules deterministically every session and every turn — no CLAUDE.md instruction to keep in sync, no dependence on the model happening to notice a tool description is relevant.
+- **Proactive retrieval:** Claude Code hooks (see below) enforce standing rules before tool use — no CLAUDE.md instruction to keep in sync, no dependence on the model happening to notice a tool description is relevant.
 
 ## Setup
 
@@ -71,7 +71,7 @@ Either way, this writes to `~/.claude.json`'s `mcpServers` key, which is what th
 
 ## Standing-rule hooks
 
-Three hooks in `~/.claude/settings.json` make retrieval deterministic every session and every turn — the first two instruct the model, the third actually enforces it:
+Three hooks in `~/.claude/settings.json` enforce `list_rules` before tool use — the first two provide reminders, the third actually enforces it:
 
 ```json
 {
@@ -89,9 +89,9 @@ Three hooks in `~/.claude/settings.json` make retrieval deterministic every sess
 }
 ```
 
-- `bin/session-rules.js` instructs the model, before its first action each session, to call the `list_rules` tool — rather than embedding rule content in the hook output directly, which doesn't scale (a large enough stored rule set gets silently truncated to a small preview before it ever reaches the model).
-- `bin/prompt-reminder.js` fires on every turn, re-issuing that same `list_rules` instruction fresh (so it can't scroll out of context the way text loaded once at session start could) and re-anchoring "capture this if it's a new rule" — there's no hook event for "the user just stated a rule," since that's a semantic judgment only the model can make.
-- `bin/pre-tool-check.js` fires before every tool call and denies it outright unless `list_rules` has already been attempted this turn — the first two hooks are advisory (a model can ignore injected text), so this is the layer that actually closes the gap instead of just repeating the ask.
+- `bin/session-rules.js` fires at session start and emits a short reminder to call `list_rules` first — rather than embedding rule content in the hook output directly, which doesn't scale (a large enough stored rule set gets silently truncated to a small preview before it ever reaches the model). It also re-arms the enforcement gate after a compaction or `/clear` (the two events that drop the already-loaded rules from context), so a reload is forced then too.
+- `bin/prompt-reminder.js` fires on every turn with a static reminder to follow the loaded conventions and to capture any new convention/instruction/preference the message states — the one obligation no hook event can detect on its own, since "the user just stated a rule" is a semantic judgment only the model can make.
+- `bin/pre-tool-check.js` fires before every tool call and denies it outright until `list_rules` has run this session — the first two hooks are advisory (reminders only), so this is the layer that actually enforces the requirement. It's forced once per session, not once per turn.
 
 None of the three touch the database directly — `list_rules` itself resolves the current project from the session's working directory when the model calls it, so this works correctly regardless of where the `conventions-mcp` install itself lives on disk.
 
@@ -106,9 +106,9 @@ None of the three touch the database directly — `list_rules` itself resolves t
 | `capture_thought` | Save a convention, instruction, correction, or preference. Embeds locally; classification is provided by the calling agent. |
 | `update_thought` | Correct/refine an existing thought in place — same id, re-embedded and re-tagged from the new content. |
 | `search_thoughts` | Hybrid semantic + keyword search. |
-| `list_thoughts` | List recent captures, optionally filtered by type or time range. |
-| `list_rules` | Every global + current-project rule in one deterministic call — no embeddings, no ranking. What the hooks use under the hood. |
-| `thought_stats` | Totals, type breakdown, top topics, and scopes. |
+| `list_thoughts` | List all captures, optionally filtered by type. |
+| `list_rules` | Every global + current-project rule in one deterministic call — no embeddings, no ranking, ordered by id. What the hooks use under the hood. |
+| `thought_stats` | Totals, type breakdown, top topics, and per-project counts. |
 | `delete_thought` | Permanently delete a thought by id. |
 
 ## Notes
