@@ -1,6 +1,6 @@
 {
   "name": "conventions-mcp",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "mcpName": "io.github.FedgeNo/conventions-mcp",
   "type": "module",
   "description": "Cross-session memory for coding conventions and standing instructions, so your AI coding assistant stops forgetting them between sessions. Local SQLite + embeddings, hybrid search, MCP over stdio.",
@@ -11,6 +11,7 @@
   "files": [
     "src",
     "bin",
+    "CLAUDE.md",
     ".env.example"
   ],
   "repository": {
