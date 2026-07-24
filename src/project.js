@@ -1,19 +1,10 @@
-import { execFileSync } from "node:child_process";
-import path from "node:path";
-
-// Deterministic project identifier, independent of the LLM — the metadata
-// extractor only decides *whether* a thought is project-specific; this
-// derives *which* project from the git root (falls back to plain cwd for a
-// non-git directory) so retrieval can do an exact match instead of fuzzy
-// text comparison against LLM-guessed project names.
+// Deterministic project identifier matching how Claude Code names this
+// project: the working directory's absolute path with path separators turned
+// into dashes (e.g. /var/www/html -> -var-www-html) — the same string Claude
+// Code uses for the per-project transcript directory under ~/.claude/projects/.
+// The LLM only decides *whether* a thought is scoped to the current project;
+// this derives *which* project, so retrieval can do an exact match rather than
+// a fuzzy comparison against an LLM-guessed name.
 export function getCurrentProject(cwd = process.cwd()) {
-  try {
-    const toplevel = execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    return path.basename(toplevel);
-  } catch {
-    return path.basename(cwd);
-  }
+  return cwd.replace(/\//g, "-");
 }

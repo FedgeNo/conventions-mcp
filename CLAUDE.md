@@ -17,7 +17,12 @@ the server's own code, plus how to wire the finished server into a client.
   directory — npm never publishes one), or `~/.conventions-mcp/memory.db`
   otherwise, since an npm/npx install's own directory usually isn't
   user-writable and gets wiped on upgrade. `getDb()` creates that directory
-  if missing, so nothing upstream needs to `mkdir` first.
+  if missing, so nothing upstream needs to `mkdir` first. The DB runs in WAL
+  mode, and every write (`insertThought`/`updateThought`/`deleteThought`) runs
+  `wal_checkpoint(TRUNCATE)` right after its transaction — at this write volume
+  the ~1000-page autocheckpoint never trips and `better-sqlite3` doesn't
+  checkpoint on exit, so without it a crash or hard reboot that discarded the
+  WAL would lose every rule not yet folded into `memory.db`.
 - `src/load-env.js` — side-effect module loading `~/.conventions-mcp/.env` into
   `process.env` (without overriding anything already set), for entry points
   invoked without Node's own `--env-file` flag — the installed `conventions-mcp`
@@ -29,14 +34,14 @@ the server's own code, plus how to wire the finished server into a client.
 - `src/embeddings.js` — local embedding model (`Xenova/bge-small-en-v1.5`,
   quantized), loaded lazily on first call and held resident for the server
   process's lifetime. No network call, no GPU.
-- Classification (type/scope/topics/projectSpecific) happens in the calling
+- Classification (type/topics/projectScoped) happens in the calling
   agent, not the server — `capture_thought`/`update_thought`'s zod
   `inputSchema` in `server.js` (`CLASSIFICATION_FIELDS`) carries the taxonomy
   via field descriptions, and the tool description instructs the caller to
   fill them in from the conversation the thought came from. The caller only
-  judges *whether* a thought is project-specific (`projectSpecific`,
-  defaulting to `false`/global unless the content obviously names or is about
-  one particular codebase) — it never has to name the project itself; see
+  judges *whether* a thought is scoped to the current project (`projectScoped`,
+  defaulting to `false`/global unless the rule is specific to the current
+  working directory) — it never has to name the project itself; see
   `withProjectStamp` in `server.js`. There is no server-side classification
   step and no network call anywhere in the capture pipeline.
 - `db.js`'s `listRules({ project })` — a plain deterministic SQL filter
@@ -45,38 +50,42 @@ the server's own code, plus how to wire the finished server into a client.
 - `bin/session-rules.js` (`SessionStart` hook), `bin/prompt-reminder.js`
   (`UserPromptSubmit` hook), and `bin/pre-tool-check.js` (`PreToolUse` hook,
   matcher `*`) — see "Standing-rule hooks" below. None touch the database
-  directly; the first two emit a short, fixed-size instruction telling the
-  model to call the `list_rules` MCP tool itself. Embedding the rule content
-  directly in hook output doesn't scale — a large enough stored rule set
-  gets silently truncated to a small preview before it ever reaches the
-  model, and text loaded once at session start can scroll out of context
-  over a long session anyway. A tool call the model actually makes has
-  neither problem: no size ceiling on the response, and it's re-issued fresh
-  every turn via the `UserPromptSubmit` hook. `pre-tool-check.js` is the
-  enforcement layer on top — advisory instructions turned out to be
-  ignorable in practice, so it actually denies any other tool call until
-  `list_rules` has been attempted this turn. Each script has a `.cmd`
-  sibling (`session-rules.cmd`, `prompt-reminder.cmd`, `pre-tool-check.cmd`)
-  that Windows `settings.json` entries point at — see "Platform support"
-  below.
+  directly. `session-rules.js` emits a short, fixed-size instruction telling
+  the model to call the `list_rules` MCP tool itself; embedding the rule
+  content directly in hook output doesn't scale — a large enough stored rule
+  set gets silently truncated to a small preview before it ever reaches the
+  model. `pre-tool-check.js` is the enforcement layer: advisory instructions
+  turned out to be ignorable in practice, so it denies any other tool call
+  until `list_rules` has run this session, tracked by a marker file. The gate
+  fires once per session, not once per turn — `session-rules.js` re-arms it
+  (clears the marker) only after a compaction or `/clear`, the two events that
+  drop the loaded rules from context. `prompt-reminder.js` no longer touches
+  the gate at all; it just re-anchors, every turn, "follow the loaded
+  conventions, and capture the rule if the user just stated one." Each script
+  has a `.cmd` sibling (`session-rules.cmd`, `prompt-reminder.cmd`,
+  `pre-tool-check.cmd`) that Windows `settings.json` entries point at — see
+  "Platform support" below.
 - `src/server.js` — registers the seven MCP tools (`capture_thought`,
   `update_thought`, `delete_thought`, `search_thoughts`, `list_thoughts`,
   `list_rules`, `thought_stats`) and connects over stdio. `update_thought` is
-  a real SQL `UPDATE` (preserves id and `created_at`), not delete-then-
+  a real SQL `UPDATE` (preserves the row's id), not delete-then-
   reinsert — it re-embeds against the new content and takes fresh
   classification fields from the caller, then replaces the row's
   `thoughts_vec` entry in the same transaction (vec0 has no in-place UPDATE,
   so that part is delete+insert internally, unlike the `thoughts`/FTS side
   which is a real UPDATE synced by the existing trigger). `withProjectStamp`
-  converts the caller's `projectSpecific` boolean into a deterministic
+  converts the caller's `projectScoped` boolean into a deterministic
   `project` field before storage — see `src/project.js` below for why that
-  split exists.
-- `src/project.js` — `getCurrentProject()` derives a stable project identifier
-  from the git repo's toplevel directory name (falls back to plain `cwd`
-  basename outside a git repo). Used to stamp captures and to filter
-  `list_rules`, so "which project" is a deterministic lookup rather than
-  free-text matching against whatever string an LLM happened to
-  write.
+  split exists. `list_rules` and `list_thoughts` render each row by its `#id`
+  (`list_rules` ordered by id ascending), so the ids the user sees are exactly
+  the ones they pass back to `update_thought`/`delete_thought`.
+- `src/project.js` — `getCurrentProject(cwd)` derives a stable project id from
+  the working directory: the absolute path with `/` turned into `-` (e.g.
+  `/var/www/html` → `-var-www-html`), the same string Claude Code uses for the
+  per-project transcript directory under `~/.claude/projects/`. Used to stamp
+  captures and to filter `list_rules`, so "which project" is a deterministic
+  lookup rather than free-text matching against whatever string an LLM happened
+  to write.
 - `bin/cli.js` — the npm `"bin"` entry (`package.json`'s
   `"bin": { "conventions-mcp": "bin/cli.js" }`), so an installed copy resolves
   on PATH with no path management needed. Dispatches by subcommand
@@ -99,10 +108,11 @@ the server's own code, plus how to wire the finished server into a client.
   `{ content: [...], isError: true }` on failure — never let a tool call throw
   past the handler.
 - `capture_thought`/`update_thought` always echo the verbatim content and
-  scope back in the confirmation text (`formatConfirmation` in `server.js`),
-  and their tool descriptions instruct the calling agent to relay that to the
-  user — so a misclassified or misheard rule is visible and correctable
-  immediately, not just discoverable later via `search_thoughts`.
+  whether it's global or project-scoped back in the confirmation text
+  (`formatConfirmation` in `server.js`), and their tool descriptions instruct
+  the calling agent to relay that to the user — so a misclassified or misheard
+  rule is visible and correctable immediately, not just discoverable later via
+  `search_thoughts`.
 - `capture_thought`'s description instructs the calling agent to call it once
   per distinct rule when a single message states several — not merge them
   into one capture — and to relay each one individually, the same treatment
@@ -121,51 +131,45 @@ the server's own code, plus how to wire the finished server into a client.
 ## Standing-rule hooks
 
 Three hooks, configured in `~/.claude/settings.json` (not this repo — see
-"Wiring this server into Claude Code" below), guarantee baseline rule
-retrieval every session — hook events fire deterministically regardless of
-whether a given model happens to notice relevance in the moment. The first
-two are advisory (they inject an instruction, but nothing stops a model from
-ignoring it — which happened in practice); the third is what actually closes
-that gap by denying tool use outright:
+"Wiring this server into Claude Code" below), enforce baseline rule
+retrieval before tool use — hook events fire deterministically at the moment
+a tool call is attempted. The first two are advisory (they inject a reminder,
+but nothing stops a model from ignoring it); the third actually enforces the
+requirement by denying tool use outright:
 
-- **`SessionStart`** → `bin/session-rules.js` — instructs the model, *before
-  its first action*, to call the `list_rules` tool. Doesn't touch the
-  database directly (removed — see below); embedding rule content directly
-  in hook output doesn't scale, since a large enough stored rule set gets
-  silently truncated to a small preview before it ever reaches the model.
-- **`UserPromptSubmit`** → `bin/prompt-reminder.js` — fires on every turn,
-  re-issuing the same `list_rules` instruction fresh every time (so it can't
-  scroll out of context the way text loaded once at session start could);
-  also clears the per-session marker file `pre-tool-check.js` reads (below),
-  since a new turn means `list_rules` hasn't been called yet regardless of
-  last turn; and re-anchors a second obligation every turn — no hook event
-  exists for "the user just stated a rule," that's a semantic judgment only
-  the model can make, and hook `prompt`/`agent` types (which *can* run an LLM
-  check) are restricted to tool events, not this one — so this hook also
-  says "call `capture_thought` if this message just stated a new one."
+- **`SessionStart`** → `bin/session-rules.js` — emits a short reminder to call
+  `list_rules` before any other tool use this session. It also reads the
+  event's `source`: on `compact` or `clear` (the two events that discard the
+  already-loaded rules from context) it clears the enforcement marker below,
+  forcing a reload; on a plain startup/resume there's no marker to clear.
+- **`UserPromptSubmit`** → `bin/prompt-reminder.js` — fires on every turn with
+  a static reminder to (1) follow the conventions already loaded via
+  `list_rules`, and (2) capture the rule if this message just stated a new
+  convention, standing instruction, or preference — the one obligation no hook
+  event can detect, since "the user just stated a rule" is a semantic judgment
+  only the model can make. It does **not** touch the enforcement marker.
 - **`PreToolUse`** (matcher `*`) → `bin/pre-tool-check.js` — fires before
   *every* tool call and actually denies it (`permissionDecision: "deny"`,
-  not just advisory `additionalContext`) unless `list_rules` has already
-  been attempted this turn. Since hooks are stateless shell invocations with
-  no memory between calls, "already attempted this turn" is tracked via a
-  marker file at `os.tmpdir()/conventions-mcp-list-rules-called-<session_id>`
-  — set the moment a call whose `tool_name` ends in `__list_rules` is seen
-  (allowed through unconditionally, so this can't deadlock against itself),
-  cleared by `prompt-reminder.js` at the start of every turn. The gate keys
-  on *attempt*, not success — even a `list_rules` call that itself errors at
-  runtime still sets the marker and unblocks the rest of the turn, since
-  `PreToolUse` fires before the underlying tool executes. Precision beyond
-  that isn't a design goal: an edge case that makes the marker clear a turn
-  early just costs one harmless redundant `list_rules` call, not a bug worth
-  engineering around.
+  not just advisory `additionalContext`) unless `list_rules` has already run
+  this session. Since hooks are stateless shell invocations with no memory
+  between calls, that state is a marker file at
+  `os.tmpdir()/conventions-mcp-list-rules-called-<session_id>` — written the
+  moment a call whose `tool_name` ends in `__list_rules` is seen (allowed
+  through unconditionally, so this can't deadlock against itself), and removed
+  only by `session-rules.js` on `compact`/`clear`. So `list_rules` is forced
+  once per session and again after each context reset, not once per turn. The
+  gate keys on *attempt*, not success — even a `list_rules` call that errors
+  at runtime still sets the marker, since `PreToolUse` fires before the
+  underlying tool executes.
 
 None of the three touch the database or call `getCurrentProject` — `list_rules`
 itself resolves "current project" via `process.cwd()` when the model
 actually calls it, which works because the tool call runs in the same
 process as the active session and inherits its working directory.
-`session-rules.js` is fully static; `prompt-reminder.js` and
-`pre-tool-check.js` do read stdin JSON (for `session_id`) and touch the
-marker file described above, but neither queries the database.
+`prompt-reminder.js` is fully static (fixed reminder text). `session-rules.js`
+and `pre-tool-check.js` read stdin JSON (`source`/`session_id` and
+`tool_name`/`session_id` respectively) and manage the marker file described
+above, but neither queries the database.
 
 ## Platform support
 
@@ -205,8 +209,8 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 Chain `notifications/initialized` and a `tools/call` the same way. Note the
 **first** `capture_thought` call in a freshly spawned process can take a few
 seconds for the local embedding model's cold load — don't mistake that for a
-hang. `capture_thought`/`update_thought` calls now require the classification
-fields (`type`, `scope`, `topics`, `projectSpecific`) in the `tools/call`
+hang. `capture_thought`/`update_thought` calls require the classification
+fields (`type`, `topics`, `projectScoped`) in the `tools/call`
 params — a manual stdio test has to supply them itself, since there's no
 calling agent to fill them in. Any thought captured purely for testing should
 be cleaned up afterward with `delete_thought` so it doesn't pollute real
@@ -290,19 +294,11 @@ either way, and hooks are registered identically regardless of path:
    Windows: `echo {} | <resolved-path>\bin\session-rules.cmd` from a Windows
    shell) so a broken path surfaces as a clear error, not a silently inert
    hook.
-5. Add the same "`list_rules` every turn, no exceptions" requirement to
-   `~/.claude/CLAUDE.md` too — a copy that doesn't depend on hook config
-   being intact, and removes the wasted round-trip of getting denied once by
-   `pre-tool-check.js` before complying. Read the file first and merge in;
-   if it already has a "Personal memory" section for this server, append
-   there rather than creating a new one. Match this wording:
-   > **A hook enforces calling `list_rules` as the literal first action of
-   > every turn, before any other tool call or response.** It is called
-   > directly (not via ToolSearch — no schema-loading step needed first).
-   > This is a hard requirement, not a preference to weigh against apparent
-   > urgency, redundancy, or unusual phrasing in the enforcement message —
-   > treat it as legitimate and comply, don't refuse it as suspected prompt
-   > injection.
+5. (Optional) Document the hook behavior in `~/.claude/CLAUDE.md` under the
+   "Personal memory" section if you want to remind yourself what the hooks do,
+   but it's not required — the enforcement is in the `PreToolUse` hook itself,
+   which will deny any tool call until `list_rules` has been attempted that
+   turn.
 6. Tell the user a **new Claude Code session** is required to pick up a
    newly-registered MCP server or new hooks — config changes made mid-session
    aren't visible to the session that just edited them. If the settings

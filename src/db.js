@@ -21,7 +21,7 @@ function defaultDbPath() {
 }
 
 export const DB_PATH = process.env.MEMORY_DB_PATH || defaultDbPath();
-const EMBEDDING_DIM = 384; // matches all-MiniLM-L6-v2 output
+const EMBEDDING_DIM = 384; // matches src/embeddings.js (Xenova/bge-small-en-v1.5)
 
 let db;
 
@@ -38,8 +38,7 @@ export function getDb() {
     CREATE TABLE IF NOT EXISTS thoughts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       content TEXT NOT NULL,
-      metadata TEXT NOT NULL DEFAULT '{}',
-      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      metadata TEXT NOT NULL DEFAULT '{}'
     );
 
     CREATE VIRTUAL TABLE IF NOT EXISTS thoughts_fts USING fts5(
@@ -81,6 +80,16 @@ function toVecBuffer(embedding) {
   return Buffer.from(new Float32Array(embedding).buffer);
 }
 
+// Fold the WAL back into memory.db immediately after a write. Without this,
+// rows sit in memory.db-wal indefinitely — the ~1000-page autocheckpoint
+// threshold is never reached at this write volume, and nothing checkpoints on
+// shutdown — so a crash or hard reboot that discards the WAL loses every
+// uncheckpointed rule. TRUNCATE also resets the WAL file to zero bytes so it
+// can't grow unbounded between checkpoints.
+function checkpoint(database) {
+  database.pragma("wal_checkpoint(TRUNCATE)");
+}
+
 export function insertThought({ content, metadata, embedding }) {
   const database = getDb();
   const insertThoughtStmt = database.prepare(
@@ -97,11 +106,13 @@ export function insertThought({ content, metadata, embedding }) {
     return thoughtId;
   });
 
-  return tx();
+  const thoughtId = tx();
+  checkpoint(database);
+  return thoughtId;
 }
 
 // Returns true if a row with that id existed and was updated, false otherwise.
-// Preserves the row's id and created_at (this is an edit, not a new capture).
+// Preserves the row's id (this is an edit, not a new capture).
 // Updates the thoughts row (FTS5 re-syncs via its own AFTER UPDATE trigger)
 // and replaces its thoughts_vec row in the same transaction — vec0 has no
 // FTS-style auto-sync trigger, and has no UPDATE support of its own, so the
@@ -124,7 +135,9 @@ export function updateThought(id, { content, metadata, embedding }) {
     return true;
   });
 
-  return tx();
+  const updated = tx();
+  if (updated) checkpoint(database);
+  return updated;
 }
 
 // Returns the deleted row's content (for a confirmation echo) or null if no
@@ -145,7 +158,9 @@ export function deleteThought(id) {
     return row.content;
   });
 
-  return tx();
+  const deletedContent = tx();
+  if (deletedContent !== null) checkpoint(database);
+  return deletedContent;
 }
 
 // Hybrid search: vector similarity (semantic) + FTS5 (exact/keyword) combined
@@ -192,7 +207,7 @@ export function hybridSearch({ queryEmbedding, queryText, limit = 10, k = 60 }) 
 
   const placeholders = rankedIds.map(() => "?").join(",");
   const rows = database
-    .prepare(`SELECT id, content, metadata, created_at FROM thoughts WHERE id IN (${placeholders})`)
+    .prepare(`SELECT id, content, metadata FROM thoughts WHERE id IN (${placeholders})`)
     .all(...rankedIds);
 
   const byId = new Map(rows.map((r) => [r.id, r]));
@@ -214,25 +229,14 @@ function ftsMatchQuery(text) {
     .join(" OR ");
 }
 
-export function listThoughts({ limit = 10, type, days } = {}) {
+export function listThoughts({ type } = {}) {
   const database = getDb();
-  let sql = "SELECT id, content, metadata, created_at FROM thoughts";
-  const conditions = [];
-  const params = [];
+  const rows = database
+    .prepare("SELECT id, content, metadata FROM thoughts ORDER BY id DESC")
+    .all()
+    .map((r) => ({ ...r, metadata: JSON.parse(r.metadata) }));
 
-  if (days) {
-    conditions.push("created_at >= datetime('now', ?)");
-    params.push(`-${days} days`);
-  }
-  if (conditions.length) sql += " WHERE " + conditions.join(" AND ");
-  sql += " ORDER BY created_at DESC LIMIT ?";
-  params.push(limit * (type ? 5 : 1)); // over-fetch if filtering by type client-side
-
-  let rows = database.prepare(sql).all(...params);
-  rows = rows.map((r) => ({ ...r, metadata: JSON.parse(r.metadata) }));
-
-  if (type) rows = rows.filter((r) => r.metadata?.type === type);
-  return rows.slice(0, limit);
+  return type ? rows.filter((r) => r.metadata?.type === type) : rows;
 }
 
 // Every thought that applies right now: global (no project stamped) plus
@@ -244,10 +248,10 @@ export function listRules({ project } = {}) {
   const database = getDb();
   const rows = database
     .prepare(
-      `SELECT id, content, metadata, created_at FROM thoughts
+      `SELECT id, content, metadata FROM thoughts
        WHERE json_extract(metadata, '$.project') IS NULL
           OR json_extract(metadata, '$.project') = ?
-       ORDER BY created_at DESC`
+       ORDER BY id`
     )
     .all(project ?? null);
 
@@ -257,26 +261,18 @@ export function listRules({ project } = {}) {
 export function thoughtStats() {
   const database = getDb();
   const { count } = database.prepare("SELECT COUNT(*) AS count FROM thoughts").get();
-  const rows = database.prepare("SELECT metadata, created_at FROM thoughts ORDER BY created_at ASC").all();
+  const rows = database.prepare("SELECT metadata FROM thoughts").all();
 
   const types = {};
   const topics = {};
-  const scopes = {};
+  const projects = {};
 
   for (const row of rows) {
     const m = JSON.parse(row.metadata);
     if (m.type) types[m.type] = (types[m.type] || 0) + 1;
     for (const t of m.topics || []) topics[t] = (topics[t] || 0) + 1;
-    if (m.scope) scopes[m.scope] = (scopes[m.scope] || 0) + 1;
+    if (m.project) projects[m.project] = (projects[m.project] || 0) + 1;
   }
 
-  return {
-    total: count,
-    dateRange: rows.length
-      ? { from: rows[0].created_at, to: rows[rows.length - 1].created_at }
-      : null,
-    types,
-    topics,
-    scopes,
-  };
+  return { total: count, types, topics, projects };
 }
