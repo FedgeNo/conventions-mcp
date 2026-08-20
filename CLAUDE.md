@@ -163,7 +163,7 @@ requirement by denying tool use outright:
   not just advisory `additionalContext`) unless `list_rules` has already run
   this session. Since hooks are stateless shell invocations with no memory
   between calls, that state is a private per-user directory (`XDG_RUNTIME_DIR`
-  when set, else the system temp directory) containing
+  when set, else `~/.conventions-mcp/hook-state`) containing
   a marker named with the SHA-256 hash of the session id — written the moment
   a call whose `tool_name` ends in `__list_rules` is seen (allowed
   through unconditionally, so this can't deadlock against itself), and removed
