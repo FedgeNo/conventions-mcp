@@ -1,16 +1,16 @@
 # conventions-mcp
 
-Personal memory for coding conventions and standing instructions — one store, any MCP-compatible AI client, available in every project. Occasional other notes are fine too, but this is primarily meant to hold things like "always use 2-space indent in this language," "never force-push to main," corrections after getting something wrong, and workflow preferences — the kind of thing that should carry across sessions and projects rather than get re-explained every time.
+Personal memory for durable coding conventions and standing instructions — one store, any MCP-compatible AI client, available in every project. It holds rules like "always use 2-space indent in this language," "never force-push to main," lasting corrections, and long-lived workflow preferences that should carry across future sessions rather than get re-explained every time. It is deliberately not a history of individual jobs or a place for task-specific directions, temporary decisions, current status, or one-off commands.
 
 ## Why this one
 
 There's no shortage of memory MCP servers — several well-established ones (mem0/OpenMemory, Zep/Graphiti, the official reference memory server, plus a long tail of smaller projects) already do "remember things across sessions." What's different here:
 
-- **Narrow taxonomy, not a general note-taking store.** Every capture gets forced into one of five purpose-built types — convention, instruction, correction, preference, other — plus a project field and topic tags. A general "remember anything" store gives you a pile of loosely-related notes to search through; this one is opinionated about what belongs in it at all, which keeps retrieval precise instead of noisy.
+- **Narrow taxonomy, not a general note-taking store.** Every capture must be a durable rule for future work and gets classified into one of five purpose-built types — convention, instruction, correction, preference, other — plus a project field and topic tags. Task-specific procedures and work history are excluded so retrieval stays precise instead of noisy.
 - **Deterministic retrieval, not best-effort.** Most memory MCPs rely entirely on the calling model noticing a tool description is relevant and deciding to call it — which fails silently and inconsistently. Three Claude Code hooks here (`SessionStart`, `UserPromptSubmit`, `PreToolUse`) make a `list_rules` call unavoidable — the first two are advisory reminders, and the third actually enforces it by denying every other tool call until `list_rules` has run. It's forced once per session (and re-armed after a compaction or `/clear`, when the loaded rules fall out of context), not once per turn. If you're not on Claude Code, you still get the tool descriptions, just not the hook guarantee.
 - **Transparent by default, not silent.** Every capture and update echoes the verbatim stored content and whether it's global or project-scoped back immediately, so a misheard or misclassified rule is visible and correctable on the spot — not something you discover three sessions later via search.
 - **Fully local, zero network calls.** SQLite + local embeddings, no hosted service, no per-token costs, no API key. Classification (type/topics/projectScoped) is done by the calling agent at capture time, guided by the tool description — it already has the full conversation the thought came from, richer context than an isolated content string would give a separate extractor model.
-- **Project-scoped without fuzzy matching.** A rule can be global (the default) or tied to one specific codebase, and which project it belongs to is derived deterministically from the working directory, not guessed by an LLM from free text — so retrieval doesn't depend on an LLM having phrased a project name consistently across captures.
+- **Project-scoped without fuzzy matching.** A rule can be global (the default) or tied to one specific codebase. Stdio clients derive the project from their working directory; HTTP clients provide an MCP root or an `X-Conventions-Project` header. The project identifier is never guessed by an LLM from free text.
 
 If what you want is a general-purpose "remember everything" store, or you're not on Claude Code and don't need the hook-driven determinism, one of the more general options above may fit better. This one is for someone who specifically wants a tight, coding-convention-focused memory that stays accurate and doesn't require trusting the model to remember to check it.
 
@@ -22,9 +22,9 @@ Every capture is classified into one of five types by the calling agent, guided 
 |---|---|
 | `convention` | A specific coding style/pattern rule (e.g. "always use 2-space indent") |
 | `instruction` | A standing directive on how to work/behave (e.g. "never force-push to main") |
-| `correction` | A past mistake and the corrected approach |
-| `preference` | A softer preference, not a hard rule |
-| `other` | Catch-all for anything that doesn't fit but still got captured |
+| `correction` | A lasting correction to future behavior |
+| `preference` | A long-lived softer preference, not a hard rule |
+| `other` | Another durable, future-facing rule that does not fit the four specific types |
 
 Each thought also gets 1–3 **topic tags** for filtering. This is deliberately narrow — it's not a general note-taking store — but the taxonomy isn't hardcoded logic, it's just the wording of the tool description and its zod schema in `src/server.js`. Retuning what counts as a `convention` vs. an `instruction`, or adding a new type, is a matter of editing that description text, not restructuring the code. The one wrinkle: the five type names are also referenced in the `type` filter's enum in `list_thoughts` (`src/server.js`) — if you rename or add a type, update that enum too or the new type will get rejected as a filter value. Everything's stored as a JSON blob column, so none of this needs a schema migration.
 
@@ -33,7 +33,7 @@ Separately, every thought gets a **project** field — `null` by default (applie
 - **Storage:** SQLite (`better-sqlite3`) + `sqlite-vec` for native vector search, FTS5 for keyword search, combined via reciprocal rank fusion. One file, no server, no daemon.
 - **Embeddings:** local, via `Xenova/bge-small-en-v1.5` (384-dim, quantized, ~130MB). Loads lazily on first use, no network call, no GPU needed.
 - **Classification:** done by the calling agent (Claude Code, or any MCP client) at capture time, guided by the tool description — no network call, no external model, no API key.
-- **Transport:** MCP over stdio. No port, no listener, no CORS, no shared secret — the trust boundary is simply "who can launch this process," same as any other local tool.
+- **Transport:** MCP over stdio by default, with an optional localhost-only Streamable HTTP mode for running it as a persistent service.
 - **Proactive retrieval:** Claude Code hooks (see below) enforce standing rules before tool use — no CLAUDE.md instruction to keep in sync, no dependence on the model happening to notice a tool description is relevant.
 
 ## Setup
@@ -53,6 +53,28 @@ conventions-mcp init-db    # creates ~/.conventions-mcp/memory.db
 ```
 
 Nothing to configure — there's no API key and no external service. `MEMORY_DB_PATH` is the only environment variable this reads, and it's optional (see `.env.example`).
+
+### Persistent local service
+
+Use Streamable HTTP when the MCP client should connect to one boot-managed
+server instead of launching a stdio child for every session:
+
+```bash
+MCP_TRANSPORT=http MCP_HTTP_HOST=127.0.0.1 MCP_HTTP_PORT=47123 conventions-mcp
+```
+
+Run that command under the operating system's service manager and configure
+the MCP client with `http://127.0.0.1:47123/mcp`. See
+[`docs/shared-service.md`](docs/shared-service.md) for complete systemd,
+launchd, and Windows setup and verification instructions. The server rejects
+non-local host headers when bound to localhost. `MCP_HTTP_HOST` defaults to
+`127.0.0.1` and `MCP_HTTP_PORT` defaults to `47123`.
+
+HTTP clients that support MCP roots need no additional project configuration.
+For clients that do not, set `X-Conventions-Project` to the absolute project
+path in project-local MCP configuration. An HTTP session without either value
+receives global rules only and cannot create a project-scoped capture, which
+prevents one project's rules from leaking into another project.
 
 ## Register with Claude Code
 
@@ -90,10 +112,10 @@ Three hooks in `~/.claude/settings.json` enforce `list_rules` before tool use �
 ```
 
 - `bin/session-rules.js` fires at session start and emits a short reminder to call `list_rules` first — rather than embedding rule content in the hook output directly, which doesn't scale (a large enough stored rule set gets silently truncated to a small preview before it ever reaches the model). It also re-arms the enforcement gate after a compaction or `/clear` (the two events that drop the already-loaded rules from context), so a reload is forced then too.
-- `bin/prompt-reminder.js` fires on every turn with a static reminder to follow the loaded conventions and to capture any new convention/instruction/preference the message states — the one obligation no hook event can detect on its own, since "the user just stated a rule" is a semantic judgment only the model can make.
+- `bin/prompt-reminder.js` fires on every turn with a static reminder to follow the loaded conventions and to capture only genuinely durable rules intended for future sessions or repeated work. It explicitly excludes task-specific directions, temporary choices, current status, incident history, one-job commands, and records of how an individual job was completed.
 - `bin/pre-tool-check.js` fires before every tool call and denies it outright until `list_rules` has run this session — the first two hooks are advisory (reminders only), so this is the layer that actually enforces the requirement. It's forced once per session, not once per turn.
 
-None of the three touch the database directly — `list_rules` itself resolves the current project from the session's working directory when the model calls it, so this works correctly regardless of where the `conventions-mcp` install itself lives on disk.
+None of the three touch the database directly. `list_rules` resolves the current project from the stdio working directory, an MCP root, or the HTTP project's `X-Conventions-Project` header.
 
 **npm package:** the scripts live inside the global install rather than a known clone path — resolve it first with `npm root -g`, then point the hook at `$(npm root -g)/conventions-mcp/bin/session-rules.js` the same way.
 
