@@ -27,6 +27,10 @@ if (subcommand === "init-db") {
   try {
     await backupDatabase(args[0]);
     console.log(`Verified backup created: ${args[0]}`);
+  } catch (error) {
+    // Scheduled runs land in a service log — one clear line, not a stack.
+    console.error(`Backup failed: ${error.message}`);
+    process.exitCode = 1;
   } finally {
     closeDb();
   }

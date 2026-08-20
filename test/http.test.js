@@ -7,6 +7,7 @@ import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -36,7 +37,7 @@ test("shared HTTP service isolates project scope while sharing durable storage",
   const directory = await mkdtemp(path.join(os.tmpdir(), "conventions-mcp-test-"));
   const port = await availablePort();
   const child = spawn(process.execPath, ["src/server.js"], {
-    cwd: path.resolve(import.meta.dirname, ".."),
+    cwd: fileURLToPath(new URL("..", import.meta.url)),
     env: {
       ...process.env,
       MCP_TRANSPORT: "http",

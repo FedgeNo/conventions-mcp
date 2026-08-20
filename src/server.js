@@ -355,8 +355,7 @@ export async function runHTTPServer() {
           ? project_header
           : null;
       const server = createConventionsServer(project_path);
-      let transport;
-      transport = new StreamableHTTPServerTransport({
+      const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (new_session_id) => {
           sessions.set(new_session_id, { server, transport });

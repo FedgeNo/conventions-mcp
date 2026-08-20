@@ -5,6 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 async function runHook(script, payload, environment) {
   const child = spawn(process.execPath, [script], {
@@ -21,9 +22,15 @@ async function runHook(script, payload, environment) {
 
 test("hook state is session-scoped, re-armed, and confined to a private directory", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "conventions-hook-test-"));
-  const environment = { ...process.env, TMPDIR: directory, TMP: directory, TEMP: directory };
-  const preTool = path.resolve(import.meta.dirname, "../bin/pre-tool-check.js");
-  const session = path.resolve(import.meta.dirname, "../bin/session-rules.js");
+  const environment = {
+    ...process.env,
+    XDG_RUNTIME_DIR: directory,
+    TMPDIR: directory,
+    TMP: directory,
+    TEMP: directory,
+  };
+  const preTool = fileURLToPath(new URL("../bin/pre-tool-check.js", import.meta.url));
+  const session = fileURLToPath(new URL("../bin/session-rules.js", import.meta.url));
   const sessionId = "../../untrusted/session";
 
   try {
