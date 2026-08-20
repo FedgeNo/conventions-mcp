@@ -6,16 +6,23 @@
 // functions just for this.
 import "../src/load-env.js";
 
-const SUBCOMMANDS = {
-  "init-db": "../src/init-db.js",
-};
+const SUBCOMMANDS = new Set(["init-db"]);
 
 const [, , subcommand] = process.argv;
 
-if (subcommand && !(subcommand in SUBCOMMANDS)) {
+if (subcommand && !SUBCOMMANDS.has(subcommand)) {
   console.error(`Unknown subcommand: ${subcommand}`);
-  console.error("Usage: conventions-mcp [init-db]  (no subcommand starts the MCP server over stdio)");
+  console.error("Usage: conventions-mcp [init-db]  (no subcommand starts the configured MCP transport)");
   process.exit(1);
 }
 
-await import(subcommand ? SUBCOMMANDS[subcommand] : "../src/server.js");
+if (subcommand === "init-db") {
+  await import("../src/init-db.js");
+} else {
+  const { runHTTPServer, runStdioServer } = await import("../src/server.js");
+  if (process.env.MCP_TRANSPORT === "http") {
+    await runHTTPServer();
+  } else {
+    await runStdioServer();
+  }
+}

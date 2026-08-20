@@ -6,5 +6,5 @@
 // this derives *which* project, so retrieval can do an exact match rather than
 // a fuzzy comparison against an LLM-guessed name.
 export function getCurrentProject(cwd = process.cwd()) {
-  return cwd.replace(/\//g, "-");
+  return cwd.replace(/[\\/:]/g, "-");
 }

@@ -61,13 +61,17 @@ the server's own code, plus how to wire the finished server into a client.
   (clears the marker) only after a compaction or `/clear`, the two events that
   drop the loaded rules from context. `prompt-reminder.js` no longer touches
   the gate at all; it just re-anchors, every turn, "follow the loaded
-  conventions, and capture the rule if the user just stated one." Each script
+  conventions, and capture only durable rules intended to govern future
+  sessions or repeated work." Task-specific directions, temporary choices,
+  status/history, one-job commands, and descriptions of how an individual job
+  was completed remain in conversation context. Each script
   has a `.cmd` sibling (`session-rules.cmd`, `prompt-reminder.cmd`,
   `pre-tool-check.cmd`) that Windows `settings.json` entries point at — see
   "Platform support" below.
 - `src/server.js` — registers the seven MCP tools (`capture_thought`,
   `update_thought`, `delete_thought`, `search_thoughts`, `list_thoughts`,
-  `list_rules`, `thought_stats`) and connects over stdio. `update_thought` is
+  `list_rules`, `thought_stats`) and connects over stdio by default or
+  localhost-only Streamable HTTP when `MCP_TRANSPORT=http`. `update_thought` is
   a real SQL `UPDATE` (preserves the row's id), not delete-then-
   reinsert — it re-embeds against the new content and takes fresh
   classification fields from the caller, then replaces the row's
@@ -113,10 +117,13 @@ the server's own code, plus how to wire the finished server into a client.
   the calling agent to relay that to the user — so a misclassified or misheard
   rule is visible and correctable immediately, not just discoverable later via
   `search_thoughts`.
-- `capture_thought`'s description instructs the calling agent to call it once
-  per distinct rule when a single message states several — not merge them
-  into one capture — and to relay each one individually, the same treatment
-  as a single capture.
+- `capture_thought`'s description and the server-level MCP instructions limit
+  storage to durable rules that should govern future sessions or repeated
+  work. They explicitly reject task-specific directions, temporary choices,
+  status/history, one-job commands, and descriptions of how an individual job
+  was completed. The description instructs the calling agent to call it once
+  per distinct qualifying rule when a single message states several — not
+  merge them into one capture — and to relay each one individually.
 - SQL: prepared statements for every query with a variable (`better-sqlite3`'s
   `.prepare()`/`.run()`/`.get()`/`.all()`), never string-interpolated SQL.
   Multi-statement writes (e.g. `insertThought`, `deleteThought`) go through
@@ -144,10 +151,11 @@ requirement by denying tool use outright:
   forcing a reload; on a plain startup/resume there's no marker to clear.
 - **`UserPromptSubmit`** → `bin/prompt-reminder.js` — fires on every turn with
   a static reminder to (1) follow the conventions already loaded via
-  `list_rules`, and (2) capture the rule if this message just stated a new
-  convention, standing instruction, or preference — the one obligation no hook
-  event can detect, since "the user just stated a rule" is a semantic judgment
-  only the model can make. It does **not** touch the enforcement marker.
+  `list_rules`, and (2) capture only a durable rule clearly meant to govern
+  future sessions or repeated work. It explicitly excludes current-task
+  directions and work history; deciding whether a statement is genuinely
+  durable is the semantic judgment only the model can make. It does **not**
+  touch the enforcement marker.
 - **`PreToolUse`** (matcher `*`) → `bin/pre-tool-check.js` — fires before
   *every* tool call and actually denies it (`permissionDecision: "deny"`,
   not just advisory `additionalContext`) unless `list_rules` has already run
@@ -162,10 +170,11 @@ requirement by denying tool use outright:
   at runtime still sets the marker, since `PreToolUse` fires before the
   underlying tool executes.
 
-None of the three touch the database or call `getCurrentProject` — `list_rules`
-itself resolves "current project" via `process.cwd()` when the model
-actually calls it, which works because the tool call runs in the same
-process as the active session and inherits its working directory.
+None of the three touch the database or call `getCurrentProject`. `list_rules`
+resolves the current project from an MCP root when supported, the process
+working directory for stdio, or `X-Conventions-Project` for HTTP. An unscoped
+HTTP client receives global rules only rather than inheriting the service's
+working directory.
 `prompt-reminder.js` is fully static (fixed reminder text). `session-rules.js`
 and `pre-tool-check.js` read stdin JSON (`source`/`session_id` and
 `tool_name`/`session_id` respectively) and manage the marker file described
@@ -217,6 +226,11 @@ be cleaned up afterward with `delete_thought` so it doesn't pollute real
 search results.
 
 ## Wiring this server into Claude Code
+
+For a shared persistent service used by multiple agents, follow
+`docs/shared-service.md` first, then register its localhost HTTP URL in each
+client. Resolve executable and data paths on the target machine; never copy
+machine-specific paths from another installation into the repository.
 
 When asked to set this server up for use (not just develop on it), do the
 following. Two install paths exist — a git checkout (development) or the
