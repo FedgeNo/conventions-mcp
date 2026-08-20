@@ -139,6 +139,25 @@ rules only and cannot create project-scoped rules.
 Restart or open a new agent session after changing MCP configuration. Existing
 HTTP sessions do not survive a service restart.
 
+## Back up the database
+
+The service holds the only copy of every rule. Schedule a daily snapshot with
+SQLite's own backup command — consistent against a live WAL database, where a
+plain file copy can catch a write in progress — and integrity-check the copy so
+a bad snapshot fails the scheduled run instead of being discovered at restore
+time:
+
+```bash
+sqlite3 "$HOME/.conventions-mcp/memory.db" ".backup '<destination>/memory-$(date +%F).db'"
+sqlite3 "<destination>/memory-$(date +%F).db" 'PRAGMA integrity_check;'
+```
+
+Run it from the platform's scheduler — a systemd user timer with
+`Persistent=true` so a machine that was asleep at the scheduled time still
+runs it, a launchd agent, or a Task Scheduler task. Keep the destination
+outside the database's own directory, and prune old snapshots so it doesn't
+grow without bound.
+
 ## Verify
 
 1. Confirm the service is listening only on `127.0.0.1:47123`.

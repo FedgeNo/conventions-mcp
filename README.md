@@ -136,5 +136,5 @@ None of the three touch the database directly. `list_rules` resolves the current
 ## Notes
 
 - If a single message states several distinct rules, `capture_thought` gets called once per rule, each relayed individually — not merged into one capture or summarized together.
-- The database lives at `data/memory.db` in a git checkout, or `~/.conventions-mcp/memory.db` for the npm package (override either with `MEMORY_DB_PATH`). It's gitignored — back it up yourself if you care about it (it's just a SQLite file; `cp` is a complete backup).
+- The database lives at `data/memory.db` in a git checkout, or `~/.conventions-mcp/memory.db` for the npm package (override either with `MEMORY_DB_PATH`). It's gitignored — back it up yourself if you care about it. It's a single SQLite file: with nothing running, `cp` is a complete backup, but against a live server snapshot it with `sqlite3 memory.db ".backup 'copy.db'"`, which is consistent even mid-write. [`docs/shared-service.md`](docs/shared-service.md) shows a scheduled setup.
 - To upgrade embedding quality later without re-architecting, swap `MODEL_NAME` in `src/embeddings.js` — but re-embed existing thoughts if the new model's vector space isn't compatible with the old one (different models' embeddings aren't comparable, even at the same dimension).
