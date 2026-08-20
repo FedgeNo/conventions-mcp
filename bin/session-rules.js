@@ -21,9 +21,7 @@
 // entries — a bare "node <path>" command string works there too, but the
 // .cmd avoids the user having to hand-quote an install path containing
 // spaces (common under C:\Users\<name>\...) inside the JSON command string.
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { clearRulesLoaded } from "./hook-state.js";
 
 let input = "";
 process.stdin.on("data", (chunk) => (input += chunk));
@@ -39,12 +37,7 @@ process.stdin.on("end", () => {
   // re-arm the gate to force a reload. Other sources don't need it: startup
   // has no marker, and resume/fork keep the rules in the restored transcript.
   if (payload.source === "compact" || payload.source === "clear") {
-    const marker = path.join(os.tmpdir(), `conventions-mcp-list-rules-called-${payload.session_id || "default"}`);
-    try {
-      fs.unlinkSync(marker);
-    } catch {
-      // Marker already absent — nothing to clear.
-    }
+    clearRulesLoaded(payload.session_id);
   }
 
   process.stdout.write(

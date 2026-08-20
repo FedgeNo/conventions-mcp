@@ -18,11 +18,13 @@ the server's own code, plus how to wire the finished server into a client.
   otherwise, since an npm/npx install's own directory usually isn't
   user-writable and gets wiped on upgrade. `getDb()` creates that directory
   if missing, so nothing upstream needs to `mkdir` first. The DB runs in WAL
-  mode, and every write (`insertThought`/`updateThought`/`deleteThought`) runs
-  `wal_checkpoint(TRUNCATE)` right after its transaction — at this write volume
-  the ~1000-page autocheckpoint never trips and `better-sqlite3` doesn't
-  checkpoint on exit, so without it a crash or hard reboot that discarded the
-  WAL would lose every rule not yet folded into `memory.db`.
+  mode with `synchronous=FULL`, a bounded autocheckpoint, and a busy timeout.
+  The WAL is part of the durable database state; writes do not force a
+  checkpoint after commit because that can fail after a successful write or
+  interfere with concurrent readers. Graceful shutdown checkpoints and closes
+  the database. The database directory and files are private to the user on
+  POSIX systems. `backupDatabase` uses SQLite's online backup API, verifies the
+  snapshot, and publishes it atomically without overwriting an existing file.
 - `src/load-env.js` — side-effect module loading `~/.conventions-mcp/.env` into
   `process.env` (without overriding anything already set), for entry points
   invoked without Node's own `--env-file` flag — the installed `conventions-mcp`
@@ -32,8 +34,8 @@ the server's own code, plus how to wire the finished server into a client.
   guarantees this runs before those reads. Nothing in this codebase requires
   an env var — `MEMORY_DB_PATH` is the only one read, and it's optional.
 - `src/embeddings.js` — local embedding model (`Xenova/bge-small-en-v1.5`,
-  quantized), loaded lazily on first call and held resident for the server
-  process's lifetime. No network call, no GPU.
+  quantized), downloaded once, loaded lazily on first call, and held resident
+  for the server process's lifetime. No GPU or hosted inference service.
 - Classification (type/topics/projectScoped) happens in the calling
   agent, not the server — `capture_thought`/`update_thought`'s zod
   `inputSchema` in `server.js` (`CLASSIFICATION_FIELDS`) carries the taxonomy
@@ -93,7 +95,7 @@ the server's own code, plus how to wire the finished server into a client.
 - `bin/cli.js` — the npm `"bin"` entry (`package.json`'s
   `"bin": { "conventions-mcp": "bin/cli.js" }`), so an installed copy resolves
   on PATH with no path management needed. Dispatches by subcommand
-  (`init-db`, or nothing → starts the MCP server) via dynamic `import()` of
+  (`init-db`, `backup`, `warmup`, or nothing → starts the MCP server) via dynamic `import()` of
   the same modules the `npm run` scripts already use — each does its work as
   a top-level side effect on import, so no refactor into exported functions
   was needed just for this. No config bootstrap step — nothing here requires
@@ -160,9 +162,9 @@ requirement by denying tool use outright:
   *every* tool call and actually denies it (`permissionDecision: "deny"`,
   not just advisory `additionalContext`) unless `list_rules` has already run
   this session. Since hooks are stateless shell invocations with no memory
-  between calls, that state is a marker file at
-  `os.tmpdir()/conventions-mcp-list-rules-called-<session_id>` — written the
-  moment a call whose `tool_name` ends in `__list_rules` is seen (allowed
+  between calls, that state is a private per-user temporary directory containing
+  a marker named with the SHA-256 hash of the session id — written the moment
+  a call whose `tool_name` ends in `__list_rules` is seen (allowed
   through unconditionally, so this can't deadlock against itself), and removed
   only by `session-rules.js` on `compact`/`clear`. So `list_rules` is forced
   once per session and again after each context reset, not once per turn. The

@@ -3,7 +3,8 @@
 // (MEMORY_DB_PATH override, else a checkout-vs-installed default) — this
 // stays a thin trigger so there's one source of truth for that logic.
 import "./load-env.js";
-import { getDb, DB_PATH } from "./db.js";
+import { closeDb, getDb, DB_PATH } from "./db.js";
 
 getDb();
+closeDb();
 console.log(`Database ready at ${DB_PATH}`);

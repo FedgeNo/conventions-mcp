@@ -15,13 +15,7 @@
 //
 // pre-tool-check.cmd (same directory) wraps this for Windows — see the note
 // in session-rules.js for why.
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-
-function markerPath(sessionId) {
-  return path.join(os.tmpdir(), `conventions-mcp-list-rules-called-${sessionId || "default"}`);
-}
+import { markRulesLoaded, rulesAreLoaded } from "./hook-state.js";
 
 let input = "";
 process.stdin.on("data", (chunk) => (input += chunk));
@@ -35,15 +29,13 @@ process.stdin.on("end", () => {
   }
 
   const toolName = payload.tool_name || "";
-  const marker = markerPath(payload.session_id);
-
   if (toolName.endsWith("__list_rules") || toolName === "list_rules") {
-    fs.writeFileSync(marker, "1");
+    markRulesLoaded(payload.session_id);
     process.stdout.write("{}");
     return;
   }
 
-  if (fs.existsSync(marker)) {
+  if (rulesAreLoaded(payload.session_id)) {
     process.stdout.write("{}");
     return;
   }

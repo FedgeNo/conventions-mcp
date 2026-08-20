@@ -47,7 +47,12 @@ test("shared HTTP service isolates project scope while sharing durable storage",
   });
   t.after(async () => {
     child.kill("SIGTERM");
-    await Promise.race([once(child, "exit"), new Promise((resolve) => setTimeout(resolve, 5_000))]);
+    const exited = await Promise.race([
+      once(child, "exit").then(() => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 5_000)),
+    ]);
+    if (!exited) child.kill("SIGKILL");
+    assert.equal(exited, true, "HTTP service did not shut down within five seconds");
     await rm(directory, { recursive: true, force: true });
   });
 
@@ -79,6 +84,12 @@ test("shared HTTP service isolates project scope while sharing durable storage",
   const secondRules = await second.callTool({ name: "list_rules", arguments: {} });
   assert.match(firstRules.content[0].text, /Use deterministic integration tests/);
   assert.doesNotMatch(secondRules.content[0].text, /Use deterministic integration tests/);
+
+  const secondSearch = await second.callTool({
+    name: "search_thoughts",
+    arguments: { query: "deterministic integration tests", limit: 10 },
+  });
+  assert.doesNotMatch(secondSearch.content[0].text, /Use deterministic integration tests/);
 
   const allThoughts = await second.callTool({ name: "list_thoughts", arguments: {} });
   assert.match(allThoughts.content[0].text, /Use deterministic integration tests/);
