@@ -53,3 +53,37 @@ test("hook state is session-scoped, re-armed, and confined to a private director
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("hook state never falls back to the shared system temp directory", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "conventions-hook-home-test-"));
+  const sharedTemp = await mkdtemp(path.join(os.tmpdir(), "conventions-hook-shared-test-"));
+  const environment = {
+    ...process.env,
+    HOME: home,
+    USERPROFILE: home,
+    TMPDIR: sharedTemp,
+    TMP: sharedTemp,
+    TEMP: sharedTemp,
+  };
+  delete environment.XDG_RUNTIME_DIR;
+  const preTool = fileURLToPath(new URL("../bin/pre-tool-check.js", import.meta.url));
+
+  try {
+    await runHook(
+      preTool,
+      { session_id: "home-fallback", tool_name: "mcp__conventions__list_rules" },
+      environment
+    );
+    const homeEntries = await import("node:fs/promises").then(({ readdir }) =>
+      readdir(path.join(home, ".conventions-mcp", "hook-state"))
+    );
+    const tempEntries = await import("node:fs/promises").then(({ readdir }) => readdir(sharedTemp));
+    assert.equal(homeEntries.length, 1);
+    assert.deepEqual(tempEntries, []);
+  } finally {
+    await Promise.all([
+      rm(home, { recursive: true, force: true }),
+      rm(sharedTemp, { recursive: true, force: true }),
+    ]);
+  }
+});

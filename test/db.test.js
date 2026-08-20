@@ -5,12 +5,13 @@ import { mkdtemp, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import Database from "better-sqlite3";
 
 const directory = await mkdtemp(path.join(os.tmpdir(), "conventions-db-test-"));
 process.env.MEMORY_DB_PATH = path.join(directory, "memory.db");
-const { DB_PATH, backupDatabase, closeDb, getDb, insertThought } = await import("../src/db.js");
+const { DB_PATH, backupDatabase, closeDb, getDb, hybridSearch, insertThought } = await import("../src/db.js");
 
 test.after(async () => {
   closeDb();
@@ -48,6 +49,30 @@ test("online backup is verified, private, and never overwrites", async () => {
   }
   if (process.platform !== "win32") assert.equal((await stat(destination)).mode & 0o777, 0o600);
   await assert.rejects(backupDatabase(destination), /already exists/);
+});
+
+test("punctuation-only text safely uses vector search", () => {
+  const results = hybridSearch({
+    queryEmbedding: Array(384).fill(0),
+    queryText: '... "*:()-',
+    limit: 10,
+    project: null,
+  });
+  assert.equal(results.length, 1);
+  assert.equal(results[0].content, "Backups preserve committed rules.");
+});
+
+test("backup CLI reports validation failures without a stack trace", async () => {
+  const cli = fileURLToPath(new URL("../bin/cli.js", import.meta.url));
+  const child = spawn(process.execPath, [cli, "backup", "relative.db"], {
+    env: { ...process.env, MEMORY_DB_PATH: DB_PATH },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let errorOutput = "";
+  child.stderr.on("data", (chunk) => (errorOutput += chunk));
+  const [code] = await once(child, "exit");
+  assert.equal(code, 1);
+  assert.match(errorOutput, /^Backup failed: Backup destination must be an absolute path\n$/);
 });
 
 test("a committed WAL write survives process termination", { timeout: 20_000 }, async () => {
