@@ -7,11 +7,12 @@ authenticated reverse proxy provides the network trust boundary.
 
 ## Before installing the service
 
-1. Install Node.js 20.6 or newer and install the package:
+1. Install Node.js 20.9 or newer and install the package:
 
    ```bash
    npm install -g conventions-mcp
    conventions-mcp init-db
+   conventions-mcp warmup
    ```
 
 2. Resolve the executable rather than copying an example path:
@@ -142,14 +143,12 @@ HTTP sessions do not survive a service restart.
 ## Back up the database
 
 The service holds the only copy of every rule. Schedule a daily snapshot with
-SQLite's own backup command — consistent against a live WAL database, where a
-plain file copy can catch a write in progress — and integrity-check the copy so
-a bad snapshot fails the scheduled run instead of being discovered at restore
-time:
+the built-in online backup command. It is consistent against a live WAL
+database, integrity-checks the temporary snapshot, refuses to overwrite an
+existing backup, and atomically publishes the verified file:
 
 ```bash
-sqlite3 "$HOME/.conventions-mcp/memory.db" ".backup '<destination>/memory-$(date +%F).db'"
-sqlite3 "<destination>/memory-$(date +%F).db" 'PRAGMA integrity_check;'
+conventions-mcp backup "<destination>/memory-$(date +%F).db"
 ```
 
 Run it from the platform's scheduler — a systemd user timer with

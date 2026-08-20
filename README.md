@@ -9,7 +9,7 @@ There's no shortage of memory MCP servers — several well-established ones (mem
 - **Narrow taxonomy, not a general note-taking store.** Every capture must be a durable rule for future work and gets classified into one of five purpose-built types — convention, instruction, correction, preference, other — plus a project field and topic tags. Task-specific procedures and work history are excluded so retrieval stays precise instead of noisy.
 - **Deterministic retrieval, not best-effort.** Most memory MCPs rely entirely on the calling model noticing a tool description is relevant and deciding to call it — which fails silently and inconsistently. Three Claude Code hooks here (`SessionStart`, `UserPromptSubmit`, `PreToolUse`) make a `list_rules` call unavoidable — the first two are advisory reminders, and the third actually enforces it by denying every other tool call until `list_rules` has run. It's forced once per session (and re-armed after a compaction or `/clear`, when the loaded rules fall out of context), not once per turn. If you're not on Claude Code, you still get the tool descriptions, just not the hook guarantee.
 - **Transparent by default, not silent.** Every capture and update echoes the verbatim stored content and whether it's global or project-scoped back immediately, so a misheard or misclassified rule is visible and correctable on the spot — not something you discover three sessions later via search.
-- **Fully local, zero network calls.** SQLite + local embeddings, no hosted service, no per-token costs, no API key. Classification (type/topics/projectScoped) is done by the calling agent at capture time, guided by the tool description — it already has the full conversation the thought came from, richer context than an isolated content string would give a separate extractor model.
+- **Fully local at runtime.** SQLite + local embeddings, no hosted service, no per-token costs, no API key. The embedding model is downloaded once on first use (or explicitly with `conventions-mcp warmup`) and then runs locally. Classification (type/topics/projectScoped) is done by the calling agent at capture time, guided by the tool description — it already has the full conversation the thought came from, richer context than an isolated content string would give a separate extractor model.
 - **Project-scoped without fuzzy matching.** A rule can be global (the default) or tied to one specific codebase. Stdio clients derive the project from their working directory; HTTP clients provide an MCP root or an `X-Conventions-Project` header. The project identifier is never guessed by an LLM from free text.
 
 If what you want is a general-purpose "remember everything" store, or you're not on Claude Code and don't need the hook-driven determinism, one of the more general options above may fit better. This one is for someone who specifically wants a tight, coding-convention-focused memory that stays accurate and doesn't require trusting the model to remember to check it.
@@ -31,10 +31,11 @@ Each thought also gets 1–3 **topic tags** for filtering. This is deliberately 
 Separately, every thought gets a **project** field — `null` by default (applies everywhere), or a specific project id if it's scoped to the current codebase. The calling agent only judges *whether* it's project-scoped (`projectScoped`); the actual project id is derived deterministically from the working directory — the absolute path with separators turned into dashes, e.g. `/var/www/html` → `-var-www-html`, matching the per-project directory name Claude Code itself uses under `~/.claude/projects/`. The model never names the project, so retrieval can do an exact match instead of fuzzy text comparison.
 
 - **Storage:** SQLite (`better-sqlite3`) + `sqlite-vec` for native vector search, FTS5 for keyword search, combined via reciprocal rank fusion. One file, no server, no daemon.
-- **Embeddings:** local, via `Xenova/bge-small-en-v1.5` (384-dim, quantized, ~130MB). Loads lazily on first use, no network call, no GPU needed.
+- **Embeddings:** local, via `Xenova/bge-small-en-v1.5` (384-dim, quantized, ~130MB). Downloads once, loads lazily, and needs no GPU.
 - **Classification:** done by the calling agent (Claude Code, or any MCP client) at capture time, guided by the tool description — no network call, no external model, no API key.
 - **Transport:** MCP over stdio by default, with an optional localhost-only Streamable HTTP mode for running it as a persistent service.
 - **Proactive retrieval:** Claude Code hooks (see below) enforce standing rules before tool use — no CLAUDE.md instruction to keep in sync, no dependence on the model happening to notice a tool description is relevant.
+- **Scoped retrieval:** `list_rules` and semantic search return global rules plus the current project's rules; project-specific rules from other codebases stay out of normal retrieval. `list_thoughts` remains the explicit all-records management view.
 
 ## Setup
 
@@ -50,6 +51,7 @@ npm run init-db        # creates data/memory.db
 ```bash
 npm install -g conventions-mcp
 conventions-mcp init-db    # creates ~/.conventions-mcp/memory.db
+conventions-mcp warmup     # downloads and verifies the embedding model
 ```
 
 Nothing to configure — there's no API key and no external service. `MEMORY_DB_PATH` is the only environment variable this reads, and it's optional (see `.env.example`).
@@ -136,5 +138,5 @@ None of the three touch the database directly. `list_rules` resolves the current
 ## Notes
 
 - If a single message states several distinct rules, `capture_thought` gets called once per rule, each relayed individually — not merged into one capture or summarized together.
-- The database lives at `data/memory.db` in a git checkout, or `~/.conventions-mcp/memory.db` for the npm package (override either with `MEMORY_DB_PATH`). It's gitignored — back it up yourself if you care about it. It's a single SQLite file: with nothing running, `cp` is a complete backup, but against a live server snapshot it with `sqlite3 memory.db ".backup 'copy.db'"`, which is consistent even mid-write. [`docs/shared-service.md`](docs/shared-service.md) shows a scheduled setup.
+- The database lives at `data/memory.db` in a git checkout, or `~/.conventions-mcp/memory.db` for the npm package (override either with `MEMORY_DB_PATH`). It's gitignored and created with private permissions. Use `conventions-mcp backup <absolute-destination>` for a live-safe, integrity-checked backup. [`docs/shared-service.md`](docs/shared-service.md) shows a scheduled setup.
 - To upgrade embedding quality later without re-architecting, swap `MODEL_NAME` in `src/embeddings.js` — but re-embed existing thoughts if the new model's vector space isn't compatible with the old one (different models' embeddings aren't comparable, even at the same dimension).

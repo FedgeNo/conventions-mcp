@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import * as sqliteVec from "sqlite-vec";
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,11 +29,18 @@ let db;
 export function getDb() {
   if (db) return db;
 
-  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+  const directory = path.dirname(DB_PATH);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") fs.chmodSync(directory, 0o700);
   db = new Database(DB_PATH);
+  if (process.platform !== "win32") fs.chmodSync(DB_PATH, 0o600);
   sqliteVec.load(db);
   db.pragma("journal_mode = WAL");
+  db.pragma("synchronous = FULL");
+  db.pragma("busy_timeout = 5000");
+  db.pragma("wal_autocheckpoint = 100");
   db.pragma("foreign_keys = ON");
+  db.pragma("secure_delete = ON");
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS thoughts (
@@ -69,6 +77,49 @@ export function getDb() {
   return db;
 }
 
+export function closeDb() {
+  if (!db) return;
+  db.pragma("wal_checkpoint(TRUNCATE)");
+  db.close();
+  db = undefined;
+}
+
+export async function backupDatabase(destination) {
+  if (!path.isAbsolute(destination)) throw new Error("Backup destination must be an absolute path");
+  if (fs.existsSync(destination)) throw new Error(`Backup destination already exists: ${destination}`);
+
+  const database = getDb();
+  const directory = path.dirname(destination);
+  const directoryExists = fs.existsSync(directory);
+  const temporary = `${destination}.tmp-${randomUUID()}`;
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  if (!directoryExists && process.platform !== "win32") fs.chmodSync(directory, 0o700);
+
+  try {
+    await database.backup(temporary);
+    const backup = new Database(temporary, { readonly: true, fileMustExist: true });
+    try {
+      sqliteVec.load(backup);
+      const rows = backup.pragma("integrity_check");
+      if (rows.length !== 1 || rows[0].integrity_check !== "ok") {
+        throw new Error(`Backup integrity check failed: ${JSON.stringify(rows)}`);
+      }
+    } finally {
+      backup.close();
+    }
+    if (process.platform !== "win32") fs.chmodSync(temporary, 0o600);
+    fs.linkSync(temporary, destination);
+    fs.unlinkSync(temporary);
+  } catch (error) {
+    try {
+      fs.unlinkSync(temporary);
+    } catch {
+      // The temporary file may not have been created.
+    }
+    throw error;
+  }
+}
+
 // vec0's primary-key column requires an unambiguous SQLITE_INTEGER bind —
 // a plain bound JS number can land as INTEGER or REAL depending on
 // better-sqlite3's internal heuristics, and vec0 rejects the latter with a
@@ -77,17 +128,10 @@ export function getDb() {
 // bytes — a bare Float32Array/ArrayBuffer is rejected by better-sqlite3's
 // own bind-type check before it even reaches vec0.
 function toVecBuffer(embedding) {
+  if (!Array.isArray(embedding) || embedding.length !== EMBEDDING_DIM) {
+    throw new Error(`Embedding must contain exactly ${EMBEDDING_DIM} numbers`);
+  }
   return Buffer.from(new Float32Array(embedding).buffer);
-}
-
-// Fold the WAL back into memory.db immediately after a write. Without this,
-// rows sit in memory.db-wal indefinitely — the ~1000-page autocheckpoint
-// threshold is never reached at this write volume, and nothing checkpoints on
-// shutdown — so a crash or hard reboot that discards the WAL loses every
-// uncheckpointed rule. TRUNCATE also resets the WAL file to zero bytes so it
-// can't grow unbounded between checkpoints.
-function checkpoint(database) {
-  database.pragma("wal_checkpoint(TRUNCATE)");
 }
 
 export function insertThought({ content, metadata, embedding }) {
@@ -107,7 +151,6 @@ export function insertThought({ content, metadata, embedding }) {
   });
 
   const thoughtId = tx();
-  checkpoint(database);
   return thoughtId;
 }
 
@@ -136,7 +179,6 @@ export function updateThought(id, { content, metadata, embedding }) {
   });
 
   const updated = tx();
-  if (updated) checkpoint(database);
   return updated;
 }
 
@@ -159,15 +201,16 @@ export function deleteThought(id) {
   });
 
   const deletedContent = tx();
-  if (deletedContent !== null) checkpoint(database);
   return deletedContent;
 }
 
 // Hybrid search: vector similarity (semantic) + FTS5 (exact/keyword) combined
 // via reciprocal rank fusion. Catches both "similar meaning" and "exact term"
 // matches, which pure vector search alone misses.
-export function hybridSearch({ queryEmbedding, queryText, limit = 10, k = 60 }) {
+export function hybridSearch({ queryEmbedding, queryText, limit = 10, k = 60, project = null }) {
   const database = getDb();
+  const { count } = database.prepare("SELECT COUNT(*) AS count FROM thoughts").get();
+  if (count === 0) return [];
 
   const vecResults = database
     .prepare(
@@ -176,7 +219,7 @@ export function hybridSearch({ queryEmbedding, queryText, limit = 10, k = 60 }) 
        WHERE embedding MATCH ? AND k = ?
        ORDER BY distance`
     )
-    .all(toVecBuffer(queryEmbedding), Math.max(limit * 4, 40));
+    .all(toVecBuffer(queryEmbedding), count);
 
   const ftsResults = queryText?.trim()
     ? database
@@ -187,7 +230,7 @@ export function hybridSearch({ queryEmbedding, queryText, limit = 10, k = 60 }) 
            ORDER BY rank
            LIMIT ?`
         )
-        .all(ftsMatchQuery(queryText), Math.max(limit * 4, 40))
+        .all(ftsMatchQuery(queryText), count)
     : [];
 
   const scores = new Map(); // thought_id -> reciprocal rank fusion score
@@ -200,7 +243,6 @@ export function hybridSearch({ queryEmbedding, queryText, limit = 10, k = 60 }) 
 
   const rankedIds = [...scores.entries()]
     .sort((a, b) => b[1] - a[1])
-    .slice(0, limit)
     .map(([id]) => id);
 
   if (rankedIds.length === 0) return [];
@@ -214,7 +256,9 @@ export function hybridSearch({ queryEmbedding, queryText, limit = 10, k = 60 }) 
   return rankedIds
     .map((id) => byId.get(id))
     .filter(Boolean)
-    .map((r) => ({ ...r, metadata: JSON.parse(r.metadata) }));
+    .map((r) => ({ ...r, metadata: JSON.parse(r.metadata) }))
+    .filter((r) => r.metadata.project == null || r.metadata.project === project)
+    .slice(0, limit);
 }
 
 // FTS5 MATCH needs simple space-separated terms, not arbitrary punctuation —

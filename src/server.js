@@ -22,7 +22,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 import { embed } from "./embeddings.js";
-import { insertThought, updateThought, deleteThought, hybridSearch, listThoughts, listRules, thoughtStats } from "./db.js";
+import { closeDb, insertThought, updateThought, deleteThought, hybridSearch, listThoughts, listRules, thoughtStats } from "./db.js";
 import { getCurrentProject } from "./project.js";
 
 const require = createRequire(import.meta.url);
@@ -73,7 +73,7 @@ const CLASSIFICATION_FIELDS = {
       "Classify using the conversation this durable rule came from: 'convention' — a specific coding style/pattern rule; 'instruction' — a standing directive on how to work/behave; 'correction' — a lasting correction to future behavior; 'preference' — a long-lived softer preference, not a hard rule; 'other' — another durable future-facing rule that genuinely belongs in this store, never task history or temporary context."
     ),
   topics: z
-    .array(z.string())
+    .array(z.string().trim().min(1).max(64))
     .min(1)
     .max(3)
     .describe("1-3 short topic tags (e.g. 'git', 'testing', 'naming')."),
@@ -99,7 +99,7 @@ export function createConventionsServer(fallback_project_path = process.cwd()) {
         "Save only a durable coding convention, standing instruction, correction, or workflow preference that should govern future sessions or repeated work — e.g. style rules ('always use 2-space indent') or standing directives ('never force-push to main'). Never capture directions specific to the current task, temporary decisions, current status, incident history, commands used for one job, or descriptions of how an individual job was completed; those belong only in the conversation. A preference mentioned while directing one task is not durable unless the user clearly states or confirms that it should apply in the future. Condense each durable rule to one sentence, two if absolutely necessary — no incident stories, user quotes, or example code. Call this when the user establishes or corrects a durable rule, or explicitly asks to retain a genuinely long-lived convention. Classify it yourself using the type/topics/projectScoped fields below, based on the conversation the thought came from. If a single message states multiple distinct durable rules, call this once per rule — don't merge them into one capture — and relay each one individually the same as a single capture, not summarized together. After every successful call, state the captured content verbatim and its project back to the user (the response text already contains both) — this is how they catch a misinterpreted rule and correct or delete it immediately, rather than discovering it wrong much later.",
       inputSchema: {
         content: z
-          .string()
+          .string().trim().min(1).max(10_000)
           .describe(
             "A durable rule for future sessions or repeated work, condensed to one sentence — two only if absolutely necessary. Do not submit task-specific directions, temporary choices, current status, incident history, one-job commands, or a record of how a job was completed. Do not include the incident it came from, the user's words, before/after stories, or example files/identifiers. Example: 'Never assign innerHTML; build with DOM methods.'"
           ),
@@ -125,9 +125,9 @@ export function createConventionsServer(fallback_project_path = process.cwd()) {
       description:
         "Correct or refine an existing thought's content in place — same id, re-embedded and re-tagged from the new content. Condense the rule to one sentence, two if absolutely necessary — no incident stories, user quotes, or example code. Use this instead of delete_thought + capture_thought whenever the user is correcting, refining, or replacing what a specific existing thought says (a stale convention, a preference that's since changed) rather than adding an unrelated new one. If the id isn't already known from context, use search_thoughts or list_thoughts first and confirm with the user which one before updating. Re-classify using the type/topics/projectScoped fields below, based on the corrected content and the conversation it came from. After a successful call, state the updated content verbatim and its project back to the user (the response text already contains both) — this is how they catch a misinterpreted rule and correct or delete it immediately.",
       inputSchema: {
-        id: z.number().describe("The numeric ID of the thought to update, as shown in search_thoughts/list_thoughts output (e.g. the '#4' in a result)"),
+        id: z.number().int().positive().describe("The numeric ID of the thought to update, as shown in search_thoughts/list_thoughts output (e.g. the '#4' in a result)"),
         content: z
-          .string()
+          .string().trim().min(1).max(10_000)
           .describe("The corrected/replacement content — condensed to one sentence, two if absolutely necessary, with no padding from the incident/user's words/example files — same as capture_thought"),
         ...CLASSIFICATION_FIELDS,
       },
@@ -154,7 +154,7 @@ export function createConventionsServer(fallback_project_path = process.cwd()) {
       description:
         "Permanently delete a specific captured thought by its ID. This is destructive and irreversible — no undo, no trash. Only call this when the user explicitly asks to delete, remove, or forget a specific thought. Never call it proactively, as a side effect of another action, or on a guess at which ID they mean — if the ID isn't already known from context, use search_thoughts or list_thoughts first and confirm with the user which one before deleting.",
       inputSchema: {
-        id: z.number().describe("The numeric ID of the thought to delete, as shown in search_thoughts/list_thoughts output (e.g. the '#4' in a result)"),
+        id: z.number().int().positive().describe("The numeric ID of the thought to delete, as shown in search_thoughts/list_thoughts output (e.g. the '#4' in a result)"),
       },
     },
     async ({ id }) => {
@@ -184,7 +184,8 @@ export function createConventionsServer(fallback_project_path = process.cwd()) {
     async ({ query, limit }) => {
       try {
         const queryEmbedding = await embed(query);
-        const results = hybridSearch({ queryEmbedding, queryText: query, limit });
+        const project = await getSessionProject(server, fallback_project_path);
+        const results = hybridSearch({ queryEmbedding, queryText: query, limit, project });
 
         if (!results.length) {
           return { content: [{ type: "text", text: `No thoughts found matching "${query}".` }] };
@@ -317,11 +318,28 @@ export async function runStdioServer() {
   const server = createConventionsServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  let stopping = false;
+  const shutdown = async () => {
+    if (stopping) return;
+    stopping = true;
+    await server.close();
+    closeDb();
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
 }
 
 export async function runHTTPServer() {
   const host = process.env.MCP_HTTP_HOST || "127.0.0.1";
-  const port = Number.parseInt(process.env.MCP_HTTP_PORT || "47123", 10);
+  const portText = process.env.MCP_HTTP_PORT || "47123";
+  const port = Number(portText);
+  if (!["127.0.0.1", "::1", "localhost"].includes(host)) {
+    throw new Error("MCP_HTTP_HOST must be a loopback host");
+  }
+  if (!/^\d+$/.test(portText) || !Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error("MCP_HTTP_PORT must be an integer from 1 through 65535");
+  }
   const sessions = new Map();
   const app = createMcpExpressApp({ host });
 
@@ -389,9 +407,15 @@ export async function runHTTPServer() {
     console.error(`Conventions MCP listening at http://${host}:${port}/mcp`);
   });
 
+  let stopping = false;
   const shutdown = async () => {
-    await new Promise((resolve) => http_server.close(resolve));
+    if (stopping) return;
+    stopping = true;
     await Promise.all([...sessions.values()].map(({ server }) => server.close()));
+    await new Promise((resolve, reject) =>
+      http_server.close((error) => (error ? reject(error) : resolve()))
+    );
+    closeDb();
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
