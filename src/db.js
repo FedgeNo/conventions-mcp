@@ -221,7 +221,11 @@ export function hybridSearch({ queryEmbedding, queryText, limit = 10, k = 60, pr
     )
     .all(toVecBuffer(queryEmbedding), count);
 
-  const ftsResults = queryText?.trim()
+  // A query of nothing but stripped punctuation yields an empty MATCH
+  // expression, which FTS5 rejects as a syntax error — fall back to
+  // vector-only results rather than failing the whole search.
+  const matchQuery = queryText?.trim() ? ftsMatchQuery(queryText) : "";
+  const ftsResults = matchQuery
     ? database
         .prepare(
           `SELECT rowid AS thought_id, rank
@@ -230,7 +234,7 @@ export function hybridSearch({ queryEmbedding, queryText, limit = 10, k = 60, pr
            ORDER BY rank
            LIMIT ?`
         )
-        .all(ftsMatchQuery(queryText), count)
+        .all(matchQuery, count)
     : [];
 
   const scores = new Map(); // thought_id -> reciprocal rank fusion score
