@@ -1,0 +1,31 @@
+{
+  "description": "Load all applicable conventions when a Codex conversation starts or its context is reset.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "^(startup|resume|clear|compact)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "conventions-mcp hook-session-rules",
+            "timeout": 5,
+            "statusMessage": "Checking standing conventions"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "conventions-mcp hook-pre-tool-check",
+            "timeout": 5,
+            "statusMessage": "Checking standing conventions"
+          }
+        ]
+      }
+    ]
+  }
+}

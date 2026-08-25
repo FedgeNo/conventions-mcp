@@ -6,13 +6,21 @@
 // functions just for this.
 import "../src/load-env.js";
 
-const SUBCOMMANDS = new Set(["init-db", "backup", "warmup"]);
+const SUBCOMMANDS = new Set([
+  "init-db",
+  "backup",
+  "warmup",
+  "hook-session-rules",
+  "hook-pre-tool-check",
+]);
 
 const [, , subcommand, ...args] = process.argv;
 
 if (subcommand && !SUBCOMMANDS.has(subcommand)) {
   console.error(`Unknown subcommand: ${subcommand}`);
-  console.error("Usage: conventions-mcp [init-db | backup <absolute-path> | warmup]");
+  console.error(
+    "Usage: conventions-mcp [init-db | backup <absolute-path> | warmup | hook-session-rules | hook-pre-tool-check]"
+  );
   process.exit(1);
 }
 
@@ -38,6 +46,10 @@ if (subcommand === "init-db") {
   const { embed } = await import("../src/embeddings.js");
   await embed("Initialize the local conventions search model.");
   console.log("Embedding model is ready.");
+} else if (subcommand === "hook-session-rules") {
+  await import("./session-rules.js");
+} else if (subcommand === "hook-pre-tool-check") {
+  await import("./pre-tool-check.js");
 } else {
   const { runHTTPServer, runStdioServer } = await import("../src/server.js");
   if (process.env.MCP_TRANSPORT === "http") {

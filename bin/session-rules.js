@@ -45,7 +45,7 @@ process.stdin.on("end", () => {
       hookSpecificOutput: {
         hookEventName: "SessionStart",
         additionalContext:
-          "Before using any tool, call mcp__conventions__list_rules to load this project's standing conventions.",
+          "Before your first tool call in this session, call mcp__conventions__list_rules once to load this project's standing conventions. Do not call it again unless context has been reset.",
       },
     })
   );
