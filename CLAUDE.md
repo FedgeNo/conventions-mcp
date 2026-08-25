@@ -49,6 +49,11 @@ the server's own code, plus how to wire the finished server into a client.
 - `db.js`'s `listRules({ project })` — a plain deterministic SQL filter
   (`project IS NULL OR project = ?`), no embeddings, no LLM call. Backs the
   `list_rules` MCP tool — cheap enough to call on every turn.
+- `hooks/hooks.json` — Codex `SessionStart` and `PreToolUse` lifecycle
+  configuration. The first runs the same fixed-size instruction used by
+  Claude Code; the second denies every other tool until the agent calls
+  `list_rules`. This avoids placing a potentially truncated rule set in hook
+  output and reuses the same marker state on both clients.
 - `bin/session-rules.js` (`SessionStart` hook), `bin/prompt-reminder.js`
   (`UserPromptSubmit` hook), and `bin/pre-tool-check.js` (`PreToolUse` hook,
   matcher `*`) — see "Standing-rule hooks" below. None touch the database
@@ -95,11 +100,11 @@ the server's own code, plus how to wire the finished server into a client.
 - `bin/cli.js` — the npm `"bin"` entry (`package.json`'s
   `"bin": { "conventions-mcp": "bin/cli.js" }`), so an installed copy resolves
   on PATH with no path management needed. Dispatches by subcommand
-  (`init-db`, `backup`, `warmup`, or nothing → starts the MCP server) via dynamic `import()` of
-  the same modules the `npm run` scripts already use — each does its work as
-  a top-level side effect on import, so no refactor into exported functions
-  was needed just for this. No config bootstrap step — nothing here requires
-  a `.env` to exist.
+  (`init-db`, `backup`, `warmup`, the two hook commands, or nothing → starts
+  the MCP server) via dynamic `import()` of the same modules the `npm run`
+  scripts already use — each does its work as a top-level side effect on
+  import, so no refactor into exported functions was needed just for this.
+  No config bootstrap step — nothing here requires a `.env` to exist.
 
 ## Conventions for this codebase
 
@@ -138,6 +143,17 @@ the server's own code, plus how to wire the finished server into a client.
   even at the same dimension).
 
 ## Standing-rule hooks
+
+Codex uses the bundled `hooks/hooks.json`. Install it at
+`~/.codex/hooks.json` (merging its `SessionStart` and `PreToolUse` entries if
+a user hook file already exists) and review it with `/hooks`. Its command
+handlers invoke `conventions-mcp hook-session-rules` and
+`conventions-mcp hook-pre-tool-check`, reusing the same enforced call gate as
+Claude Code. `SessionStart` runs again with source `compact` after both manual
+and automatic compaction, re-arming the gate before the continuation.
+
+Claude Code uses the three command hooks below because it does not provide
+Codex's direct MCP-tool hook handler:
 
 Three hooks, configured in `~/.claude/settings.json` (not this repo — see
 "Wiring this server into Claude Code" below), enforce baseline rule
@@ -315,7 +331,7 @@ either way, and hooks are registered identically regardless of path:
    "Personal memory" section if you want to remind yourself what the hooks do,
    but it's not required — the enforcement is in the `PreToolUse` hook itself,
    which will deny any tool call until `list_rules` has been attempted that
-   turn.
+   session, or since the last compaction or `/clear`.
 6. Tell the user a **new Claude Code session** is required to pick up a
    newly-registered MCP server or new hooks — config changes made mid-session
    aren't visible to the session that just edited them. If the settings

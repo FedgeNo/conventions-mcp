@@ -43,7 +43,9 @@ test("hook state is session-scoped, re-armed, and confined to a private director
     );
     assert.deepEqual(await runHook(preTool, { session_id: sessionId, tool_name: "Read" }, environment), {});
 
-    await runHook(session, { session_id: sessionId, source: "compact" }, environment);
+    const sessionReminder = await runHook(session, { session_id: sessionId, source: "compact" }, environment);
+    assert.match(sessionReminder.hookSpecificOutput.additionalContext, /first tool call in this session/);
+    assert.match(sessionReminder.hookSpecificOutput.additionalContext, /Do not call it again/);
     const deniedAgain = await runHook(preTool, { session_id: sessionId, tool_name: "Read" }, environment);
     assert.equal(deniedAgain.hookSpecificOutput.permissionDecision, "deny");
 

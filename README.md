@@ -7,7 +7,7 @@ Personal memory for durable coding conventions and standing instructions — one
 There's no shortage of memory MCP servers — several well-established ones (mem0/OpenMemory, Zep/Graphiti, the official reference memory server, plus a long tail of smaller projects) already do "remember things across sessions." What's different here:
 
 - **Narrow taxonomy, not a general note-taking store.** Every capture must be a durable rule for future work and gets classified into one of five purpose-built types — convention, instruction, correction, preference, other — plus a project field and topic tags. Task-specific procedures and work history are excluded so retrieval stays precise instead of noisy.
-- **Deterministic retrieval, not best-effort.** Most memory MCPs rely entirely on the calling model noticing a tool description is relevant and deciding to call it — which fails silently and inconsistently. Three Claude Code hooks here (`SessionStart`, `UserPromptSubmit`, `PreToolUse`) make a `list_rules` call unavoidable — the first two are advisory reminders, and the third actually enforces it by denying every other tool call until `list_rules` has run. It's forced once per session (and re-armed after a compaction or `/clear`, when the loaded rules fall out of context), not once per turn. If you're not on Claude Code, you still get the tool descriptions, just not the hook guarantee.
+- **Deterministic retrieval, not best-effort.** Most memory MCPs rely entirely on the calling model noticing a tool description is relevant and deciding to call it — which fails silently and inconsistently. Codex and Claude Code hooks force the agent to call `list_rules`: `SessionStart` supplies the instruction, while `PreToolUse` denies every other tool until the call has happened.
 - **Transparent by default, not silent.** Every capture and update echoes the verbatim stored content and whether it's global or project-scoped back immediately, so a misheard or misclassified rule is visible and correctable on the spot — not something you discover three sessions later via search.
 - **Fully local at runtime.** SQLite + local embeddings, no hosted service, no per-token costs, no API key. The embedding model is downloaded once on first use (or explicitly with `conventions-mcp warmup`) and then runs locally. Classification (type/topics/projectScoped) is done by the calling agent at capture time, guided by the tool description — it already has the full conversation the thought came from, richer context than an isolated content string would give a separate extractor model.
 - **Project-scoped without fuzzy matching.** A rule can be global (the default) or tied to one specific codebase. Stdio clients derive the project from their working directory; HTTP clients provide an MCP root or an `X-Conventions-Project` header. The project identifier is never guessed by an LLM from free text.
@@ -34,7 +34,7 @@ Separately, every thought gets a **project** field — `null` by default (applie
 - **Embeddings:** local, via `Xenova/bge-small-en-v1.5` (384-dim, quantized, ~130MB). Downloads once, loads lazily, and needs no GPU.
 - **Classification:** done by the calling agent (Claude Code, or any MCP client) at capture time, guided by the tool description — no network call, no external model, no API key.
 - **Transport:** MCP over stdio by default, with an optional localhost-only Streamable HTTP mode for running it as a persistent service.
-- **Proactive retrieval:** Claude Code hooks (see below) enforce standing rules before tool use — no CLAUDE.md instruction to keep in sync, no dependence on the model happening to notice a tool description is relevant.
+- **Proactive retrieval:** Codex and Claude Code hooks (see below) load or enforce standing rules at every context boundary — no project instruction file to keep in sync, no dependence on the model happening to notice a tool description is relevant.
 - **Scoped retrieval:** `list_rules` and semantic search return global rules plus the current project's rules; project-specific rules from other codebases stay out of normal retrieval. `list_thoughts` remains the explicit all-records management view.
 
 ## Setup
@@ -93,7 +93,13 @@ claude mcp add --scope user conventions -- conventions-mcp
 
 Either way, this writes to `~/.claude.json`'s `mcpServers` key, which is what the CLI actually reads; a `mcpServers` entry placed directly in `~/.claude/settings.json` is silently inert. Verify with `claude mcp list`. A new Claude Code session is required to pick up a newly-registered server.
 
-## Standing-rule hooks
+## Codex standing-rule hook
+
+`hooks/hooks.json` contains user-scoped Codex `SessionStart` and `PreToolUse` hooks. The first tells the agent to call `list_rules`; the second denies every other tool until that call happens. The gate is re-armed after `/clear` and compaction, when the loaded rules leave context. The rules themselves are not placed in hook output, so a large rule set cannot be truncated before the agent receives it from the MCP tool.
+
+Install it as `~/.codex/hooks.json`. If that file already contains hooks, merge this file's `SessionStart` and `PreToolUse` entries instead of replacing the existing configuration. The hook expects the MCP server to be registered as `conventions`, matching the setup command above, and the installed `conventions-mcp` command to be on `PATH`. Open `/hooks` once in Codex to review and trust the newly installed hooks; a new session is required before a startup hook can fire.
+
+## Claude Code standing-rule hooks
 
 Three hooks in `~/.claude/settings.json` enforce `list_rules` before tool use — the first two provide reminders, the third actually enforces it:
 
