@@ -13,7 +13,7 @@
     "bin",
     "hooks",
     "docs",
-    "CLAUDE.md",
+    "AGENTS.md",
     ".env.example"
   ],
   "repository": {
