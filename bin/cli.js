@@ -10,6 +10,7 @@ const SUBCOMMANDS = new Set([
   "init-db",
   "backup",
   "warmup",
+  "codex-project-header",
   "hook-session-rules",
   "hook-pre-tool-check",
 ]);
@@ -19,7 +20,7 @@ const [, , subcommand, ...args] = process.argv;
 if (subcommand && !SUBCOMMANDS.has(subcommand)) {
   console.error(`Unknown subcommand: ${subcommand}`);
   console.error(
-    "Usage: conventions-mcp [init-db | backup <absolute-path> | warmup | hook-session-rules | hook-pre-tool-check]"
+    "Usage: conventions-mcp [init-db | backup <absolute-path> | warmup | codex-project-header | hook-session-rules | hook-pre-tool-check]"
   );
   process.exit(1);
 }
@@ -46,6 +47,8 @@ if (subcommand === "init-db") {
   const { embed } = await import("../src/embeddings.js");
   await embed("Initialize the local conventions search model.");
   console.log("Embedding model is ready.");
+} else if (subcommand === "codex-project-header") {
+  console.log(JSON.stringify({ "X-Conventions-Project": process.cwd() }));
 } else if (subcommand === "hook-session-rules") {
   await import("./session-rules.js");
 } else if (subcommand === "hook-pre-tool-check") {

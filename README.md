@@ -78,6 +78,18 @@ path in project-local MCP configuration. An HTTP session without either value
 receives global rules only and cannot create a project-scoped capture, which
 prevents one project's rules from leaking into another project.
 
+Codex can supply the active workspace to a shared HTTP server dynamically:
+
+```toml
+[mcp_servers.conventions]
+url = "http://127.0.0.1:47123/mcp"
+http_headers_helper = "conventions-mcp codex-project-header"
+```
+
+Codex runs the helper in the active workspace. The server converts that
+absolute path to its project identifier, so `/var/www/html` becomes
+`-var-www-html`.
+
 ## Register with Claude Code
 
 Register at **user scope** so it's available in every project, not just one repo — use the `claude mcp add` CLI, not a hand-edited config file:

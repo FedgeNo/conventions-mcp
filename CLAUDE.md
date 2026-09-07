@@ -100,11 +100,14 @@ the server's own code, plus how to wire the finished server into a client.
 - `bin/cli.js` — the npm `"bin"` entry (`package.json`'s
   `"bin": { "conventions-mcp": "bin/cli.js" }`), so an installed copy resolves
   on PATH with no path management needed. Dispatches by subcommand
-  (`init-db`, `backup`, `warmup`, the two hook commands, or nothing → starts
-  the MCP server) via dynamic `import()` of the same modules the `npm run`
+  (`init-db`, `backup`, `warmup`, `codex-project-header`, the two hook commands,
+  or nothing → starts the MCP server) via dynamic `import()` of the same modules the `npm run`
   scripts already use — each does its work as a top-level side effect on
   import, so no refactor into exported functions was needed just for this.
-  No config bootstrap step — nothing here requires a `.env` to exist.
+  `codex-project-header` prints the current working directory as the
+  `X-Conventions-Project` JSON header expected by Codex's
+  `http_headers_helper`. No config bootstrap step — nothing here requires a
+  `.env` to exist.
 
 ## Conventions for this codebase
 
