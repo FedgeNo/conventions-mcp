@@ -9,13 +9,14 @@ import { x as extractTarball } from "tar";
 
 const execFileAsync = promisify(execFile);
 const repository = fileURLToPath(new URL("..", import.meta.url));
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+const npmCli = process.env.npm_execpath;
 const temporary = await mkdtemp(path.join(os.tmpdir(), "conventions-package-smoke-"));
 
 try {
+  assert.ok(npmCli, "Run the package smoke check through npm run test:package");
   const { stdout: packOutput } = await execFileAsync(
-    npm,
-    ["pack", "--json", "--pack-destination", temporary],
+    process.execPath,
+    [npmCli, "pack", "--json", "--pack-destination", temporary],
     { cwd: repository }
   );
   const [{ filename }] = JSON.parse(packOutput);
