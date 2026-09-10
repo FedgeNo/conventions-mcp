@@ -6,9 +6,14 @@
 // db.js — same dimension as all-MiniLM-L6-v2, so the schema needed no change).
 // Stronger retrieval quality than MiniLM at a still-small footprint.
 
-import { pipeline } from "@huggingface/transformers";
+import { env, pipeline } from "@huggingface/transformers";
+import os from "node:os";
+import path from "node:path";
+import { EMBEDDING_MODEL } from "./storage-format.js";
 
-const MODEL_NAME = "Xenova/bge-small-en-v1.5";
+export const MODEL_NAME = EMBEDDING_MODEL;
+export const MODEL_CACHE_PATH = process.env.MEMORY_MODEL_CACHE_PATH || path.join(os.homedir(), ".conventions-mcp", "models");
+env.cacheDir = MODEL_CACHE_PATH;
 
 let embedderPromise;
 

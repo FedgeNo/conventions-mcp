@@ -22,8 +22,9 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 import { embed } from "./embeddings.js";
-import { closeDb, insertThought, updateThought, deleteThought, hybridSearch, listThoughts, listRules, thoughtStats } from "./db.js";
+import { closeDb, getDb, insertThought, updateThought, deleteThought, hybridSearch, listThoughts, listRules, thoughtStats } from "./db.js";
 import { getCurrentProject } from "./project.js";
+import { parseShutdownTimeout, runBoundedShutdown } from "./shutdown.js";
 
 const require = createRequire(import.meta.url);
 const { version: PACKAGE_VERSION } = require("../package.json");
@@ -85,7 +86,7 @@ const CLASSIFICATION_FIELDS = {
 const SERVER_INSTRUCTIONS =
   "Store only durable conventions, standing instructions, corrections, and preferences that should affect future work. Never capture task-specific directions, temporary choices, current status, incident history, commands used for one job, or how an individual job happened to be completed. A direction that applies only to the current request belongs in conversation context, not this store. Capture it only when the user clearly states or confirms that it should govern future sessions or repeated work.";
 
-export function createConventionsServer(fallback_project_path = process.cwd()) {
+export function createConventionsServer(fallback_project_path = process.cwd(), embedFunction = embed) {
   const server = new McpServer(
     { name: "conventions-mcp", version: PACKAGE_VERSION },
     { instructions: SERVER_INSTRUCTIONS }
@@ -108,7 +109,7 @@ export function createConventionsServer(fallback_project_path = process.cwd()) {
     },
     async ({ content, type, topics, projectScoped }) => {
       try {
-        const embedding = await embed(content);
+        const embedding = await embedFunction(content);
         const metadata = await withProjectStamp(server, fallback_project_path, { type, topics, projectScoped });
         const id = insertThought({ content, metadata, embedding });
         return { content: [{ type: "text", text: formatConfirmation("Captured", id, content, metadata) }] };
@@ -134,7 +135,7 @@ export function createConventionsServer(fallback_project_path = process.cwd()) {
     },
     async ({ id, content, type, topics, projectScoped }) => {
       try {
-        const embedding = await embed(content);
+        const embedding = await embedFunction(content);
         const metadata = await withProjectStamp(server, fallback_project_path, { type, topics, projectScoped });
         const updated = updateThought(id, { content, metadata, embedding });
         if (!updated) {
@@ -183,7 +184,7 @@ export function createConventionsServer(fallback_project_path = process.cwd()) {
     },
     async ({ query, limit }) => {
       try {
-        const queryEmbedding = await embed(query);
+        const queryEmbedding = await embedFunction(query);
         const project = await getSessionProject(server, fallback_project_path);
         const results = hybridSearch({ queryEmbedding, queryText: query, limit, project });
 
@@ -315,6 +316,7 @@ export function createConventionsServer(fallback_project_path = process.cwd()) {
 }
 
 export async function runStdioServer() {
+  const shutdownTimeoutMs = parseShutdownTimeout();
   const server = createConventionsServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
@@ -323,50 +325,113 @@ export async function runStdioServer() {
   const shutdown = async () => {
     if (stopping) return;
     stopping = true;
-    await server.close();
-    closeDb();
+    const clean = await runBoundedShutdown({
+      tasks: [() => server.close()],
+      timeoutMs: shutdownTimeoutMs,
+      force: () => process.stdin.destroy(),
+      closeDatabase: closeDb,
+      logError: console.error,
+    });
+    if (!clean) process.exitCode = 1;
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 }
 
-export async function runHTTPServer() {
+export async function runHTTPServer({ embedFunction = embed } = {}) {
+  const shutdownTimeoutMs = parseShutdownTimeout();
   const host = process.env.MCP_HTTP_HOST || "127.0.0.1";
   const portText = process.env.MCP_HTTP_PORT || "47123";
   const port = Number(portText);
+  const maxSessionsText = process.env.MCP_HTTP_MAX_SESSIONS || "100";
+  const sessionIdleMsText = process.env.MCP_HTTP_SESSION_IDLE_MS || "1800000";
+  const maxSessions = Number(maxSessionsText);
+  const sessionIdleMs = Number(sessionIdleMsText);
   if (!["127.0.0.1", "::1", "localhost"].includes(host)) {
     throw new Error("MCP_HTTP_HOST must be a loopback host");
   }
   if (!/^\d+$/.test(portText) || !Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new Error("MCP_HTTP_PORT must be an integer from 1 through 65535");
   }
+  if (!/^\d+$/.test(maxSessionsText) || !Number.isInteger(maxSessions) || maxSessions < 1) {
+    throw new Error("MCP_HTTP_MAX_SESSIONS must be a positive integer");
+  }
+  if (!/^\d+$/.test(sessionIdleMsText) || !Number.isInteger(sessionIdleMs) || sessionIdleMs < 1_000) {
+    throw new Error("MCP_HTTP_SESSION_IDLE_MS must be an integer of at least 1000");
+  }
   const sessions = new Map();
+  let pendingSessions = 0;
   const app = createMcpExpressApp({ host });
+
+  const removeSession = (sessionId) => {
+    const session = sessions.get(sessionId);
+    if (!session) return;
+    clearTimeout(session.idleTimer);
+    sessions.delete(sessionId);
+  };
+
+  const refreshSession = (sessionId, session) => {
+    clearTimeout(session.idleTimer);
+    session.idleTimer = setTimeout(async () => {
+      removeSession(sessionId);
+      await session.server.close().catch((error) => {
+        console.error(`Failed to close idle MCP session: ${error.message}`);
+      });
+    }, sessionIdleMs);
+    session.idleTimer.unref();
+  };
+
+  app.get("/healthz", (_request, response) => {
+    try {
+      getDb().prepare("SELECT 1").get();
+      response.json({ status: "ok", version: PACKAGE_VERSION });
+    } catch (error) {
+      response.status(503).json({ status: "error", error: error.message });
+    }
+  });
 
   app.post("/mcp", async (request, response) => {
     const session_id = request.headers["mcp-session-id"];
     let session = typeof session_id === "string" ? sessions.get(session_id) : null;
+    let hasSessionReservation = false;
 
     if (!session && !session_id && isInitializeRequest(request.body)) {
+      if (sessions.size + pendingSessions >= maxSessions) {
+        response.status(503).json({
+          jsonrpc: "2.0",
+          error: { code: -32001, message: "Maximum MCP session count reached" },
+          id: request.body.id ?? null,
+        });
+        return;
+      }
+      pendingSessions += 1;
+      hasSessionReservation = true;
       const project_header = request.headers["x-conventions-project"];
       const project_path =
         typeof project_header === "string" &&
         (path.isAbsolute(project_header) || path.win32.isAbsolute(project_header))
           ? project_header
           : null;
-      const server = createConventionsServer(project_path);
+      const server = createConventionsServer(project_path, embedFunction);
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (new_session_id) => {
-          sessions.set(new_session_id, { server, transport });
+          const newSession = { server, transport, idleTimer: null };
+          sessions.set(new_session_id, newSession);
+          refreshSession(new_session_id, newSession);
         },
       });
       transport.onclose = () => {
         for (const [stored_session_id, stored_session] of sessions) {
-          if (stored_session.transport === transport) sessions.delete(stored_session_id);
+          if (stored_session.transport === transport) removeSession(stored_session_id);
         }
       };
-      await server.connect(transport);
+      try {
+        await server.connect(transport);
+      } catch (error) {
+        pendingSessions -= 1;
+        throw error;
+      }
       session = { server, transport };
     }
 
@@ -379,7 +444,12 @@ export async function runHTTPServer() {
       return;
     }
 
-    await session.transport.handleRequest(request, response, request.body);
+    if (typeof session_id === "string") refreshSession(session_id, session);
+    try {
+      await session.transport.handleRequest(request, response, request.body);
+    } finally {
+      if (hasSessionReservation) pendingSessions -= 1;
+    }
   });
 
   app.get("/mcp", async (request, response) => {
@@ -389,6 +459,7 @@ export async function runHTTPServer() {
       response.status(400).send("Invalid or missing MCP session ID");
       return;
     }
+    refreshSession(session_id, session);
     await session.transport.handleRequest(request, response);
   });
 
@@ -399,6 +470,7 @@ export async function runHTTPServer() {
       response.status(400).send("Invalid or missing MCP session ID");
       return;
     }
+    refreshSession(session_id, session);
     await session.transport.handleRequest(request, response);
   });
 
@@ -410,11 +482,21 @@ export async function runHTTPServer() {
   const shutdown = async () => {
     if (stopping) return;
     stopping = true;
-    await Promise.all([...sessions.values()].map(({ server }) => server.close()));
-    await new Promise((resolve, reject) =>
-      http_server.close((error) => (error ? reject(error) : resolve()))
-    );
-    closeDb();
+    for (const session of sessions.values()) clearTimeout(session.idleTimer);
+    http_server.closeIdleConnections();
+    const clean = await runBoundedShutdown({
+      tasks: [
+        ...[...sessions.values()].map(({ server }) => () => server.close()),
+        () => new Promise((resolve, reject) =>
+          http_server.close((error) => (error ? reject(error) : resolve()))
+        ),
+      ],
+      timeoutMs: shutdownTimeoutMs,
+      force: () => http_server.closeAllConnections(),
+      closeDatabase: closeDb,
+      logError: console.error,
+    });
+    if (!clean) process.exitCode = 1;
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);

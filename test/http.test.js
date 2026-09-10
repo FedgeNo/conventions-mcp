@@ -36,16 +36,29 @@ async function connectClient(port, project) {
 test("shared HTTP service isolates project scope while sharing durable storage", { timeout: 60_000 }, async (t) => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "conventions-mcp-test-"));
   const port = await availablePort();
-  const child = spawn(process.execPath, ["src/server.js"], {
+  const serverUrl = new URL("../src/server.js", import.meta.url).href;
+  const child = spawn(process.execPath, [
+    "--input-type=module",
+    "--eval",
+    `
+      const { runHTTPServer } = await import(${JSON.stringify(serverUrl)});
+      const embedFunction = async () => Array(384).fill(0);
+      await runHTTPServer({ embedFunction });
+    `,
+  ], {
     cwd: fileURLToPath(new URL("..", import.meta.url)),
     env: {
       ...process.env,
       MCP_TRANSPORT: "http",
       MCP_HTTP_PORT: String(port),
+      MCP_HTTP_MAX_SESSIONS: "2",
+      MCP_SHUTDOWN_TIMEOUT_MS: "1000",
       MEMORY_DB_PATH: path.join(directory, "memory.db"),
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
+  let serverErrors = "";
+  child.stderr.on("data", (chunk) => (serverErrors += chunk));
   t.after(async () => {
     child.kill("SIGTERM");
     const exited = await Promise.race([
@@ -58,9 +71,17 @@ test("shared HTTP service isolates project scope while sharing durable storage",
   });
 
   await once(child.stderr, "data");
+  const health = await fetch(`http://127.0.0.1:${port}/healthz`);
+  assert.equal(health.status, 200);
+  assert.deepEqual(await health.json(), { status: "ok", version: packageVersion });
   const first = await connectClient(port, "/projects/first");
   const second = await connectClient(port, "/projects/second");
   t.after(async () => Promise.allSettled([first.close(), second.close()]));
+
+  await assert.rejects(
+    connectClient(port, "/projects/third"),
+    /503|Maximum MCP session count reached/
+  );
 
   const tools = await first.listTools();
   assert.equal(first.getServerVersion().version, packageVersion);
@@ -79,7 +100,7 @@ test("shared HTTP service isolates project scope while sharing durable storage",
       projectScoped: true,
     },
   });
-  assert.match(captured.content[0].text, /project: -projects-first/);
+  assert.match(captured.content[0].text, /project: -projects-first/, serverErrors);
 
   const firstRules = await first.callTool({ name: "list_rules", arguments: {} });
   const secondRules = await second.callTool({ name: "list_rules", arguments: {} });

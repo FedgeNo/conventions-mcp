@@ -18,5 +18,27 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - run: npm ci
+        env:
+          ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+      - run: npm run check:docs
       - run: npm test
-      - run: npm publish
+      - run: npm run test:package
+      - id: pack
+        name: Build release tarball
+        shell: bash
+        run: |
+          tarball=$(npm pack --json | node -e 'let input=""; process.stdin.on("data", c => input += c); process.stdin.on("end", () => process.stdout.write(JSON.parse(input)[0].filename))')
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+      - name: Install and validate release tarball
+        shell: bash
+        env:
+          ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+        run: |
+          prefix=$(mktemp -d)
+          trap 'rm -rf "$prefix"' EXIT
+          npm install --global --prefix "$prefix" "./${{ steps.pack.outputs.tarball }}"
+          "$prefix/bin/conventions-mcp" --version
+          MEMORY_DB_PATH="$prefix/doctor/memory.db" \
+            MEMORY_MODEL_CACHE_PATH="$prefix/models" \
+            "$prefix/bin/conventions-mcp" doctor
+      - run: npm publish "./${{ steps.pack.outputs.tarball }}"

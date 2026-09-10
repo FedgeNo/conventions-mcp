@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { EMBEDDING_DIMENSION, STORAGE_METADATA } from "./storage-format.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -22,12 +23,14 @@ function defaultDbPath() {
 }
 
 export const DB_PATH = process.env.MEMORY_DB_PATH || defaultDbPath();
-const EMBEDDING_DIM = 384; // matches src/embeddings.js (Xenova/bge-small-en-v1.5)
+const RESTORE_LOCK_PATH = `${DB_PATH}.restore.lock`;
+const EMBEDDING_DIM = EMBEDDING_DIMENSION;
 
 let db;
 
-export function getDb() {
+export function getDb({ allowLegacy = false, allowRestore = false } = {}) {
   if (db) return db;
+  if (!allowRestore && fs.existsSync(RESTORE_LOCK_PATH)) throw new Error("Database restore is in progress");
 
   const directory = path.dirname(DB_PATH);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -47,6 +50,11 @@ export function getDb() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       content TEXT NOT NULL,
       metadata TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS app_metadata (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     );
 
     CREATE VIRTUAL TABLE IF NOT EXISTS thoughts_fts USING fts5(
@@ -74,7 +82,112 @@ export function getDb() {
     );
   `);
 
+  validateStorageMetadata(db, { allowLegacy });
+
   return db;
+}
+
+function validateStorageMetadata(database, { allowLegacy = false } = {}) {
+  const metadataRows = database.prepare("SELECT key, value FROM app_metadata").all();
+  if (metadataRows.length === 0) {
+    const { count } = database.prepare("SELECT COUNT(*) AS count FROM thoughts").get();
+    if (count === 0) writeStorageMetadata(database);
+    else if (!allowLegacy) {
+      database.close();
+      db = undefined;
+      throw new Error("Legacy storage has no format metadata; run conventions-mcp migrate-storage <absolute-backup-path>");
+    }
+  } else {
+    const actual = Object.fromEntries(metadataRows.map(({ key, value }) => [key, value]));
+    for (const [key, expected] of Object.entries(STORAGE_METADATA)) {
+      if (actual[key] !== expected) {
+        database.close();
+        db = undefined;
+        throw new Error(`Incompatible storage ${key}: found ${actual[key] ?? "missing"}, expected ${expected}`);
+      }
+    }
+  }
+
+}
+
+function writeStorageMetadata(database) {
+  const insert = database.prepare("INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?, ?)");
+  for (const [key, value] of Object.entries(STORAGE_METADATA)) insert.run(key, value);
+}
+
+export async function migrateLegacyStorage(destination, embedFunction) {
+  const database = getDb({ allowLegacy: true });
+  const existing = database.prepare("SELECT key FROM app_metadata LIMIT 1").get();
+  if (existing) return false;
+  await backupDatabase(destination);
+  const rows = database.prepare("SELECT id, content FROM thoughts ORDER BY id").all();
+  const embeddings = [];
+  for (const row of rows) embeddings.push({ id: row.id, embedding: await embedFunction(row.content) });
+  const replaceVectors = database.transaction(() => {
+    database.prepare("DELETE FROM thoughts_vec").run();
+    const insert = database.prepare("INSERT INTO thoughts_vec (thought_id, embedding) VALUES (CAST(? AS INTEGER), ?)");
+    for (const row of embeddings) insert.run(row.id, toVecBuffer(row.embedding));
+    writeStorageMetadata(database);
+  });
+  replaceVectors();
+  return true;
+}
+
+function verifyDatabaseFile(filename) {
+  const candidate = new Database(filename, { readonly: true, fileMustExist: true });
+  try {
+    sqliteVec.load(candidate);
+    const integrity = candidate.pragma("integrity_check", { simple: true });
+    if (integrity !== "ok") throw new Error(`Integrity check failed: ${integrity}`);
+    validateStorageMetadata(candidate);
+  } finally {
+    if (candidate.open) candidate.close();
+  }
+}
+
+export async function restoreDatabase(source, rollbackDestination) {
+  if (!path.isAbsolute(source) || !path.isAbsolute(rollbackDestination)) {
+    throw new Error("Restore source and rollback destination must be absolute paths");
+  }
+  if (source === DB_PATH || rollbackDestination === DB_PATH || source === rollbackDestination) {
+    throw new Error("Restore source, live database, and rollback destination must be different files");
+  }
+  if (!fs.existsSync(source)) throw new Error(`Restore source does not exist: ${source}`);
+  if (!fs.existsSync(DB_PATH)) throw new Error(`Live database does not exist: ${DB_PATH}`);
+  if (fs.existsSync(rollbackDestination)) throw new Error(`Rollback destination already exists: ${rollbackDestination}`);
+
+  const lock = fs.openSync(RESTORE_LOCK_PATH, "wx", 0o600);
+  const temporary = `${DB_PATH}.restore-${randomUUID()}`;
+  const displaced = `${DB_PATH}.previous-${randomUUID()}`;
+  try {
+    if (fs.existsSync(`${DB_PATH}-wal`) || fs.existsSync(`${DB_PATH}-shm`)) {
+      throw new Error("Live database appears to be open; stop all conventions-mcp processes before restore");
+    }
+    verifyDatabaseFile(source);
+    await backupDatabase(rollbackDestination, { allowRestore: true });
+    closeDb();
+    fs.copyFileSync(source, temporary, fs.constants.COPYFILE_EXCL);
+    if (process.platform !== "win32") fs.chmodSync(temporary, 0o600);
+    verifyDatabaseFile(temporary);
+
+    fs.renameSync(DB_PATH, displaced);
+    try {
+      fs.renameSync(temporary, DB_PATH);
+      getDb({ allowRestore: true });
+      closeDb();
+      fs.unlinkSync(displaced);
+    } catch (error) {
+      closeDb();
+      if (fs.existsSync(DB_PATH)) fs.unlinkSync(DB_PATH);
+      fs.renameSync(displaced, DB_PATH);
+      throw error;
+    }
+  } finally {
+    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+    if (fs.existsSync(displaced) && !fs.existsSync(DB_PATH)) fs.renameSync(displaced, DB_PATH);
+    fs.closeSync(lock);
+    fs.unlinkSync(RESTORE_LOCK_PATH);
+  }
 }
 
 export function closeDb() {
@@ -84,11 +197,11 @@ export function closeDb() {
   db = undefined;
 }
 
-export async function backupDatabase(destination) {
+export async function backupDatabase(destination, { allowRestore = false } = {}) {
   if (!path.isAbsolute(destination)) throw new Error("Backup destination must be an absolute path");
   if (fs.existsSync(destination)) throw new Error(`Backup destination already exists: ${destination}`);
 
-  const database = getDb();
+  const database = getDb({ allowRestore });
   const directory = path.dirname(destination);
   const directoryExists = fs.existsSync(directory);
   const temporary = `${destination}.tmp-${randomUUID()}`;

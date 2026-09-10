@@ -26,6 +26,14 @@ supported clients.
   the database. The database directory and files are private to the user on
   POSIX systems. `backupDatabase` uses SQLite's online backup API, verifies the
   snapshot, and publishes it atomically without overwriting an existing file.
+  `app_metadata` records the storage schema, embedding model, and dimension.
+  Unknown non-empty legacy stores are rejected until `migrate-storage` creates
+  a verified backup and re-embeds every row; declared incompatible formats are
+  never silently adopted.
+  `restoreDatabase` requires a stopped service (no WAL/SHM sidecars), validates
+  the source and current-format metadata, makes a non-overwriting online
+  rollback backup, stages the source beside the live database, and uses
+  same-filesystem renames with rollback on publication failure.
 - `src/load-env.js` — side-effect module loading `~/.conventions-mcp/.env` into
   `process.env` (without overriding anything already set), for entry points
   invoked without Node's own `--env-file` flag — the installed `conventions-mcp`
@@ -36,7 +44,13 @@ supported clients.
   an env var — `MEMORY_DB_PATH` is the only one read, and it's optional.
 - `src/embeddings.js` — local embedding model (`Xenova/bge-small-en-v1.5`,
   quantized), downloaded once, loaded lazily on first call, and held resident
-  for the server process's lifetime. No GPU or hosted inference service.
+  for the server process's lifetime. Its cache is persistent at
+  `~/.conventions-mcp/models` unless `MEMORY_MODEL_CACHE_PATH` overrides it,
+  rather than living inside an npm installation that upgrades may replace.
+  No GPU or hosted inference service.
+  The tracked `.npmrc` sets `onnxruntime-node-install-cuda=skip`; do not remove
+  it unless GPU inference is deliberately implemented and tested, because
+  ONNX Runtime otherwise downloads an unused CUDA artifact on Linux x64.
 - Classification (type/topics/projectScoped) happens in the calling
   agent, not the server — `capture_thought`/`update_thought`'s zod
   `inputSchema` in `server.js` (`CLASSIFICATION_FIELDS`) carries the taxonomy
@@ -79,7 +93,12 @@ supported clients.
 - `src/server.js` — registers the seven MCP tools (`capture_thought`,
   `update_thought`, `delete_thought`, `search_thoughts`, `list_thoughts`,
   `list_rules`, `thought_stats`) and connects over stdio by default or
-  localhost-only Streamable HTTP when `MCP_TRANSPORT=http`. `update_thought` is
+  localhost-only Streamable HTTP when `MCP_TRANSPORT=http`. HTTP exposes a
+  database-backed `/healthz` readiness check and bounds retained sessions with
+  `MCP_HTTP_MAX_SESSIONS` and `MCP_HTTP_SESSION_IDLE_MS`. Both transports use
+  `src/shutdown.js` to bound graceful cleanup with
+  `MCP_SHUTDOWN_TIMEOUT_MS`; failures are logged and set a failing process
+  status while database cleanup is still attempted. `update_thought` is
   a real SQL `UPDATE` (preserves the row's id), not delete-then-
   reinsert — it re-embeds against the new content and takes fresh
   classification fields from the caller, then replaces the row's
@@ -91,6 +110,10 @@ supported clients.
   split exists. `list_rules` and `list_thoughts` render each row by its `#id`
   (`list_rules` ordered by id ascending), so the ids the user sees are exactly
   the ones they pass back to `update_thought`/`delete_thought`.
+  `createConventionsServer` and `runHTTPServer` accept an optional embedding
+  function for deterministic tests; production entry points always use the
+  real local model. HTTP integration tests must inject a 384-value embedding
+  rather than downloading the model, so the suite is reproducible offline.
 - `src/project.js` — `getCurrentProject(cwd)` derives a stable project id from
   the working directory: the absolute path with `/` turned into `-` (e.g.
   `/var/www/html` → `-var-www-html`). Used to stamp captures and to filter
@@ -99,14 +122,20 @@ supported clients.
 - `bin/cli.js` — the npm `"bin"` entry (`package.json`'s
   `"bin": { "conventions-mcp": "bin/cli.js" }`), so an installed copy resolves
   on PATH with no path management needed. Dispatches by subcommand
-  (`init-db`, `backup`, `warmup`, `codex-project-header`, the two hook commands,
-  or nothing → starts the MCP server) via dynamic `import()` of the same modules the `npm run`
+  (`init-db`, `backup`, `warmup`, `doctor`, `codex-project-header`, the two hook commands,
+  `--help`, `--version`, or nothing → starts the MCP server) via dynamic
+  `import()` of the same modules the `npm run`
   scripts already use — each does its work as a top-level side effect on
   import, so no refactor into exported functions was needed just for this.
   `codex-project-header` prints the current working directory as the
   `X-Conventions-Project` JSON header expected by Codex's
   `http_headers_helper`. No config bootstrap step — nothing here requires a
   `.env` to exist.
+- `src/doctor.js` — non-downloading operational diagnostics used by the
+  `doctor` CLI command. It checks the supported Node.js floor, opens and
+  quick-checks SQLite, verifies the vec0 table and data permissions, and
+  reports whether the configured model cache looks complete. A missing model
+  is a warning; runtime/storage failures make the command exit nonzero.
 
 ## Conventions for this codebase
 
@@ -232,6 +261,17 @@ Linux, macOS, and Windows:
 
 ## Testing
 
+Run `npm run check:docs` for Markdown hygiene and local links, `npm test` for
+the source suite, and `npm run test:package` to pack the exact
+publish artifact, extract it into a clean temporary directory, and verify its
+CLI help/version entry point from the resulting installed-package layout.
+Native dependency installation is already exercised by `npm ci`; a separate
+network-enabled release check remains responsible for registry resolution and
+npm-generated bin links.
+The manual publish workflow performs that final check against the exact
+tarball, runs its generated executable and `doctor` from a clean global prefix,
+and publishes that same tarball only after validation succeeds.
+
 Verify changes by driving the server directly over stdio (it speaks
 line-delimited JSON-RPC on stdin/stdout):
 
@@ -251,6 +291,17 @@ be cleaned up afterward with `delete_thought` so it doesn't pollute real
 search results.
 
 ## Wiring this server into agent clients
+
+Use [`docs/install.md`](docs/install.md) as the canonical, client-neutral
+installation runbook. An installation agent must choose stdio or shared HTTP,
+discover executable paths on the target machine, preserve unrelated client
+configuration, restart the client, run the end-to-end capture/list/delete
+acceptance test, and remove its disposable test record. Do not claim success
+from process startup alone. For clients other than Codex and Claude Code, use
+the generic MCP registration guidance there and consult the client's current
+official documentation rather than guessing its configuration format. Note
+that clients without compatible lifecycle hooks get advisory rule loading,
+not the enforced gate provided by the bundled Codex and Claude Code hooks.
 
 For a shared persistent service used by multiple agents, follow
 `docs/shared-service.md` first, then register its localhost HTTP URL in each
@@ -286,7 +337,7 @@ either way, and hooks are registered identically regardless of path:
 
 1. Get the code.
    - **Git checkout:** from the project root, `npm install`.
-   - **npm install:** `npm install -g conventions-mcp`.
+   - **npm install:** `npm install -g conventions-mcp --onnxruntime-node-install-cuda=skip`.
    No config to set — there's no API key and no external service.
    `MEMORY_DB_PATH` is the only environment variable this reads, and it's
    optional (see `.env.example`).

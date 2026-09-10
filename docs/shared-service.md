@@ -10,7 +10,7 @@ authenticated reverse proxy provides the network trust boundary.
 1. Install Node.js 20.9 or newer and install the package:
 
    ```bash
-   npm install -g conventions-mcp
+   npm install -g conventions-mcp --onnxruntime-node-install-cuda=skip
    conventions-mcp init-db
    conventions-mcp warmup
    ```
@@ -31,7 +31,18 @@ The service environment is:
 MCP_TRANSPORT=http
 MCP_HTTP_HOST=127.0.0.1
 MCP_HTTP_PORT=47123
+MCP_HTTP_MAX_SESSIONS=100
+MCP_HTTP_SESSION_IDLE_MS=1800000
+MCP_SHUTDOWN_TIMEOUT_MS=10000
 ```
+
+`MCP_HTTP_MAX_SESSIONS` bounds simultaneously retained protocol sessions.
+`MCP_HTTP_SESSION_IDLE_MS` closes sessions with no MCP request activity after
+the configured interval (30 minutes by default; minimum 1000 milliseconds).
+`MCP_SHUTDOWN_TIMEOUT_MS` bounds graceful transport shutdown (10 seconds by
+default; minimum 1000 milliseconds). Exceeding it forces HTTP connections
+closed, logs the failure, closes the database, and produces a failing exit
+status for the service manager.
 
 ## Linux (systemd user service)
 
@@ -157,9 +168,27 @@ runs it, a launchd agent, or a Task Scheduler task. Keep the destination
 outside the database's own directory, and prune old snapshots so it doesn't
 grow without bound.
 
+## Restore a snapshot
+
+Stop every conventions-mcp process cleanly, then provide both the snapshot and
+a new rollback destination:
+
+```bash
+conventions-mcp restore "/absolute/path/to/snapshot.db" "/absolute/path/to/pre-restore-rollback.db"
+```
+
+Restore refuses relative or overlapping paths, existing rollback files,
+incompatible/corrupt snapshots, and live SQLite WAL/SHM sidecars. It creates an
+integrity-checked online backup of the current database first, stages and
+verifies the snapshot, publishes it with same-filesystem renames, validates the
+new live database, and restores the displaced database if publication fails.
+Keep the rollback until the restored service passes its acceptance test.
+
 ## Verify
 
-1. Confirm the service is listening only on `127.0.0.1:47123`.
+1. Confirm the service is listening only on `127.0.0.1:47123` and that
+   `curl --fail http://127.0.0.1:47123/healthz` returns an `ok` status and the
+   installed package version.
 2. Connect two MCP clients with different project roots.
 3. Confirm `tools/list` returns seven tools and the server version matches the
    installed package version.
