@@ -31,13 +31,18 @@ Each thought also gets 1–3 **topic tags** for filtering. This is deliberately 
 Separately, every thought gets a **project** field — `null` by default (applies everywhere), or a specific project id if it's scoped to the current codebase. The calling agent only judges *whether* it's project-scoped (`projectScoped`); the actual project id is derived deterministically from the working directory — the absolute path with separators turned into dashes, e.g. `/var/www/html` → `-var-www-html`, matching the per-project directory name Claude Code itself uses under `~/.claude/projects/`. The model never names the project, so retrieval can do an exact match instead of fuzzy text comparison.
 
 - **Storage:** SQLite (`better-sqlite3`) + `sqlite-vec` for native vector search, FTS5 for keyword search, combined via reciprocal rank fusion. One file, no server, no daemon.
-- **Embeddings:** local, via `Xenova/bge-small-en-v1.5` (384-dim, quantized, ~130MB). Downloads once, loads lazily, and needs no GPU.
+- **Embeddings:** local, via `Xenova/bge-small-en-v1.5` (384-dim, quantized, ~130MB). Downloads once to `~/.conventions-mcp/models`, loads lazily, and needs no GPU.
 - **Classification:** done by the calling agent (Claude Code, or any MCP client) at capture time, guided by the tool description — no network call, no external model, no API key.
 - **Transport:** MCP over stdio by default, with an optional localhost-only Streamable HTTP mode for running it as a persistent service.
 - **Proactive retrieval:** Codex and Claude Code hooks (see below) load or enforce standing rules at every context boundary — no project instruction file to keep in sync, no dependence on the model happening to notice a tool description is relevant.
 - **Scoped retrieval:** `list_rules` and semantic search return global rules plus the current project's rules; project-specific rules from other codebases stay out of normal retrieval. `list_thoughts` remains the explicit all-records management view.
 
 ## Setup
+
+> **Installing with an AI coding agent?** Give it this repository and ask it to
+> follow the canonical [installation and client-integration runbook](docs/install.md).
+> The runbook requires path discovery, config merging rather than overwriting,
+> a real capture/list/delete acceptance test, and cleanup of the test record.
 
 Two ways to get this: a git checkout (if you want to read/modify the source) or the npm package (if you just want it running).
 
@@ -49,12 +54,22 @@ npm run init-db        # creates data/memory.db
 
 **npm package:**
 ```bash
-npm install -g conventions-mcp
+npm install -g conventions-mcp --onnxruntime-node-install-cuda=skip
 conventions-mcp init-db    # creates ~/.conventions-mcp/memory.db
 conventions-mcp warmup     # downloads and verifies the embedding model
 ```
 
 Nothing to configure — there's no API key and no external service. `MEMORY_DB_PATH` is the only environment variable this reads, and it's optional (see `.env.example`).
+
+Use `conventions-mcp --help` to inspect the installed commands and
+`conventions-mcp --version` to confirm which release is on PATH. See
+[`SECURITY.md`](SECURITY.md) for the local trust model and private reporting
+instructions.
+Run `conventions-mcp doctor` for a non-downloading runtime, database, permission,
+vector-extension, and model-cache readiness report.
+Legacy databases without format metadata require the backup-first
+`conventions-mcp migrate-storage <absolute-backup-path>` command; declared
+incompatible formats are rejected rather than guessed.
 
 ### Persistent local service
 
@@ -71,6 +86,9 @@ the MCP client with `http://127.0.0.1:47123/mcp`. See
 launchd, and Windows setup and verification instructions. The server rejects
 non-local host headers when bound to localhost. `MCP_HTTP_HOST` defaults to
 `127.0.0.1` and `MCP_HTTP_PORT` defaults to `47123`.
+The service exposes `GET /healthz` for loopback readiness checks and bounds
+retained sessions with `MCP_HTTP_MAX_SESSIONS` (default 100) and
+`MCP_HTTP_SESSION_IDLE_MS` (default 30 minutes).
 
 HTTP clients that support MCP roots need no additional project configuration.
 For clients that do not, set `X-Conventions-Project` to the absolute project
@@ -154,6 +172,9 @@ None of the three touch the database directly. `list_rules` resolves the current
 | `delete_thought` | Permanently delete a thought by id. |
 
 ## Notes
+
+- Follow [`docs/upgrading.md`](docs/upgrading.md) for backup-first upgrades,
+  legacy vector migration, guarded restore, and rollback.
 
 - If a single message states several distinct rules, `capture_thought` gets called once per rule, each relayed individually — not merged into one capture or summarized together.
 - The database lives at `data/memory.db` in a git checkout, or `~/.conventions-mcp/memory.db` for the npm package (override either with `MEMORY_DB_PATH`). It's gitignored and created with private permissions. Use `conventions-mcp backup <absolute-destination>` for a live-safe, integrity-checked backup. [`docs/shared-service.md`](docs/shared-service.md) shows a scheduled setup.

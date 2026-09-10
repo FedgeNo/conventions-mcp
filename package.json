@@ -14,6 +14,7 @@
     "hooks",
     "docs",
     "AGENTS.md",
+    "SECURITY.md",
     ".env.example"
   ],
   "repository": {
@@ -41,7 +42,9 @@
     "start": "node src/server.js",
     "init-db": "node src/init-db.js",
     "warmup": "node bin/cli.js warmup",
-    "test": "node --test"
+    "test": "node --test",
+    "test:package": "node scripts/package-smoke.js",
+    "check:docs": "node scripts/check-docs.js"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.7.6",

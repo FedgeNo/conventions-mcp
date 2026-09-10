@@ -1,7 +1,16 @@
 node_modules/
 data/
+# Custom MEMORY_DB_PATH values and interrupted restore staging must never be
+# committed; they can contain private conventions or rollback copies.
+*.db
+*.db-wal
+*.db-shm
+*.db.restore.lock
+*.db.restore-*
+*.db.previous-*
 .env
-.npmrc
+# The repository .npmrc contains only the CPU-runtime install setting. Never
+# add registry credentials or user tokens to it.
 *.log
 .DS_Store
 .vscode/
