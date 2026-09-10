@@ -23,6 +23,8 @@ jobs:
       - run: npm run check:docs
       - run: npm test
       - run: npm run test:package
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=critical
       - id: pack
         name: Build release tarball
         shell: bash
