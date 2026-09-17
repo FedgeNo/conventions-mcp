@@ -2,8 +2,8 @@ const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
 
 export function parseShutdownTimeout(value = process.env.MCP_SHUTDOWN_TIMEOUT_MS) {
   if (value === undefined || value === "") return DEFAULT_SHUTDOWN_TIMEOUT_MS;
-  if (!/^\d+$/.test(value) || Number(value) < 1_000 || !Number.isSafeInteger(Number(value))) {
-    throw new Error("MCP_SHUTDOWN_TIMEOUT_MS must be a safe integer of at least 1000");
+  if (!/^\d+$/.test(value) || Number(value) < 1_000 || Number(value) > 2_147_483_647 || !Number.isSafeInteger(Number(value))) {
+    throw new Error("MCP_SHUTDOWN_TIMEOUT_MS must be a safe integer of at least 1000 and at most 2147483647");
   }
   return Number(value);
 }

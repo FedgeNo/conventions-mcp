@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, rm, stat, mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -60,6 +60,23 @@ test("punctuation-only text safely uses vector search", () => {
   });
   assert.equal(results.length, 1);
   assert.equal(results[0].content, "Backups preserve committed rules.");
+});
+
+test("backup staging is private before SQLite copies records", async () => {
+  if (process.platform === "win32") return;
+  const publicDirectory = path.join(directory, "shared-backups");
+  await mkdir(publicDirectory, { mode: 0o755 });
+  const db = getDb();
+  const original = db.backup;
+  db.backup = async function(filename) {
+    assert.equal((await stat(filename)).mode & 0o777, 0o600);
+    const result = await original.call(this, filename);
+    assert.equal((await stat(filename)).mode & 0o777, 0o600);
+    return result;
+  };
+  try { await backupDatabase(path.join(publicDirectory, "private.db")); }
+  finally { db.backup = original; }
+  assert.equal((await stat(publicDirectory)).mode & 0o777, 0o755);
 });
 
 test("backup CLI reports validation failures without a stack trace", async () => {

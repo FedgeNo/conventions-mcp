@@ -7,7 +7,7 @@ authenticated reverse proxy provides the network trust boundary.
 
 ## Before installing the service
 
-1. Install Node.js 20.9 or newer and install the package:
+1. Install Node.js 20.9 or newer and choose one source. For an npm installation:
 
    ```bash
    npm install -g conventions-mcp --onnxruntime-node-install-cuda=skip
@@ -15,14 +15,33 @@ authenticated reverse proxy provides the network trust boundary.
    conventions-mcp warmup
    ```
 
-2. Resolve the executable rather than copying an example path:
+   For a source checkout, work in that checkout instead:
+
+   ```bash
+   npm install
+   node bin/cli.js init-db
+   node bin/cli.js warmup
+   node bin/cli.js doctor
+   ```
+
+   Keep the same source for the service, hooks, backup jobs, and manual commands.
+   A checkout does not need a global npm installation. When commands below say
+   `conventions-mcp`, checkout users substitute
+   `"/absolute/path/to/node" "/absolute/path/to/checkout/bin/cli.js"`.
+
+2. Resolve the executable rather than copying an example path (npm mode):
 
    - Linux/macOS: `command -v conventions-mcp`
    - Windows PowerShell: `(Get-Command conventions-mcp).Source`
 
+   For checkout mode, resolve Node (`command -v node` or `Get-Command node`)
+   and the checkout's absolute `bin/cli.js` path. Quote paths containing spaces.
+
 3. Choose a persistent database path. The installed default is
-   `~/.conventions-mcp/memory.db`; set `MEMORY_DB_PATH` only when a different
-   location is required. Never place credentials or machine-specific paths in
+   `~/.conventions-mcp/memory.db`; a checkout defaults to `data/memory.db` inside
+   that checkout. Set `MEMORY_DB_PATH` explicitly in the service and backup job
+   so changing executable location never selects a different database.
+   Never place credentials or machine-specific paths in
    the repository.
 
 The service environment is:
@@ -38,16 +57,27 @@ MCP_SHUTDOWN_TIMEOUT_MS=10000
 
 `MCP_HTTP_MAX_SESSIONS` bounds simultaneously retained protocol sessions.
 `MCP_HTTP_SESSION_IDLE_MS` closes sessions with no MCP request activity after
-the configured interval (30 minutes by default; minimum 1000 milliseconds).
+the configured interval (30 minutes by default; range 1000–2147483647 milliseconds).
+Active tool calls suspend expiry, and the idle interval starts again after
+completion. Graceful shutdown drains tool results before closing transports.
 `MCP_SHUTDOWN_TIMEOUT_MS` bounds graceful transport shutdown (10 seconds by
-default; minimum 1000 milliseconds). Exceeding it forces HTTP connections
+default; range 1000–2147483647 milliseconds). Exceeding it forces HTTP connections
 closed, logs the failure, closes the database, and produces a failing exit
 status for the service manager.
 
 ## Linux (systemd user service)
 
+Check both `systemctl status conventions-mcp.service` and
+`systemctl --user status conventions-mcp.service` before installing a unit.
+Use one service manager scope for the listener; do not add a user service
+when a system service already owns the port. A port conflict fails startup
+with `EADDRINUSE` and a nonzero exit status.
+
 Create `~/.config/systemd/user/conventions-mcp.service`. Replace
 `<absolute-executable-path>` with the result of `command -v conventions-mcp`.
+For a checkout, replace the entire ExecStart line with
+`ExecStart="/absolute/path/to/node" "/absolute/path/to/checkout/bin/cli.js"`.
+Set `Environment=MEMORY_DB_PATH=/absolute/path/to/data/memory.db` in either mode.
 
 ```ini
 [Unit]
@@ -103,6 +133,10 @@ Create `~/Library/LaunchAgents/io.github.fedgeno.conventions-mcp.plist`, replaci
 </plist>
 ```
 
+For a checkout, use two ProgramArguments entries: the absolute Node executable
+and the absolute checkout `bin/cli.js` path. Set MEMORY_DB_PATH in
+EnvironmentVariables to the chosen database in either mode.
+
 Load and inspect it:
 
 ```bash
@@ -129,6 +163,10 @@ and executes:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File <absolute-launcher-path>
 ```
 
+For a checkout, replace the launcher invocation with
+`& 'C:\absolute\node.exe' 'C:\absolute\checkout\bin\cli.js'` and set
+`$env:MEMORY_DB_PATH` explicitly. Use that same source and database for backups.
+
 Configure the task to restart after failure. Start it once from Task Scheduler
 and confirm its last-run result is successful. A service wrapper such as WinSW
 is also suitable when operation before login is required; give it the same
@@ -147,9 +185,20 @@ Clients that advertise MCP roots are scoped automatically. Otherwise add an
 Do this in project-local client configuration so different agents cannot
 inherit the wrong project. Sessions without a root or header receive global
 rules only and cannot create project-scoped rules.
+Root requests have a one-second deadline; resolved scope is cached and
+invalidated by roots-change notifications. A failed lookup uses the configured
+fallback and retries after 30 seconds. New scopes use normalized `path:` IDs;
+see the explicit legacy migration in [upgrading.md](upgrading.md).
 
 Restart or open a new agent session after changing MCP configuration. Existing
 HTTP sessions do not survive a service restart.
+
+Expired or unknown session IDs receive HTTP 404 so clients can initialize a
+new session. Requests missing a required session ID receive HTTP 400. If a
+client keeps failing after an idle interval or restart while `/healthz` is
+healthy, reconnect that client; some clients do not recover expired sessions
+automatically. A successful health check alone does not verify an existing
+client's MCP connection.
 
 ## Back up the database
 

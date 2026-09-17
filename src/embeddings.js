@@ -15,19 +15,19 @@ export const MODEL_NAME = EMBEDDING_MODEL;
 export const MODEL_CACHE_PATH = process.env.MEMORY_MODEL_CACHE_PATH || path.join(os.homedir(), ".conventions-mcp", "models");
 env.cacheDir = MODEL_CACHE_PATH;
 
-let embedderPromise;
-
-function getEmbedder() {
-  if (!embedderPromise) {
-    embedderPromise = pipeline("feature-extraction", MODEL_NAME, {
-      dtype: "q8", // quantized — smallest footprint
-    });
-  }
-  return embedderPromise;
+export function createEmbedder(load = () => pipeline("feature-extraction", MODEL_NAME, { dtype: "q8" })) {
+  let pending;
+  return async text => {
+    if (!pending) {
+      pending = Promise.resolve().then(load).catch(error => {
+        pending = undefined;
+        throw error;
+      });
+    }
+    const embedder = await pending;
+    const output = await embedder(text, { pooling: "mean", normalize: true });
+    return Array.from(output.data);
+  };
 }
 
-export async function embed(text) {
-  const embedder = await getEmbedder();
-  const output = await embedder(text, { pooling: "mean", normalize: true });
-  return Array.from(output.data);
-}
+export const embed = createEmbedder();

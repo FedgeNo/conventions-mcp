@@ -20,6 +20,7 @@ Commands:
   warmup                          Download and verify the embedding model
   doctor                          Validate runtime, storage, and model readiness
   migrate-storage <backup-path>   Back up and reindex legacy storage
+  migrate-project <path> <backup> Back up and assign a legacy project scope
   restore <source> <rollback>     Restore a verified snapshot with rollback
   codex-project-header            Print the active project HTTP header as JSON
   hook-session-rules              Run the SessionStart hook
@@ -33,6 +34,7 @@ const SUBCOMMANDS = new Set([
   "warmup",
   "doctor",
   "migrate-storage",
+  "migrate-project",
   "restore",
   "codex-project-header",
   "hook-session-rules",
@@ -91,6 +93,18 @@ if (subcommand === "init-db") {
   } finally {
     closeDb();
   }
+} else if (subcommand === "migrate-project") {
+  if (args.length !== 2) {
+    console.error("Usage: conventions-mcp migrate-project <absolute-project-path> <absolute-backup-path>");
+    process.exit(1);
+  }
+  const { migrateProjectScope, closeDb } = await import("../src/db.js");
+  try {
+    console.log(`Migrated ${await migrateProjectScope(args[0], args[1])} project rules.`);
+  } catch (error) {
+    console.error(`Project migration failed: ${error.message}`);
+    process.exitCode = 1;
+  } finally { closeDb(); }
 } else if (subcommand === "restore") {
   if (args.length !== 2) {
     console.error("Usage: conventions-mcp restore <absolute-source> <absolute-rollback-destination>");

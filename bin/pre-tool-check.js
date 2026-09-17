@@ -8,8 +8,8 @@
 // "Already loaded" is tracked via a per-session marker file (hooks are
 // stateless, with no memory of their own): this script writes the marker the
 // moment it sees a list_rules call go by, and session-rules.js removes it at
-// the boundaries where the loaded rules leave context — after compaction and
-// after /clear — so the model is forced to reload before its next tool use.
+// every SessionStart, including resume, so the model is forced to reload
+// before its next tool use.
 // Between those boundaries the marker persists, so list_rules is forced once,
 // not once per turn.
 //

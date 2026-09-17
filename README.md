@@ -28,7 +28,11 @@ Every capture is classified into one of five types by the calling agent, guided 
 
 Each thought also gets 1–3 **topic tags** for filtering. This is deliberately narrow — it's not a general note-taking store — but the taxonomy isn't hardcoded logic, it's just the wording of the tool description and its zod schema in `src/server.js`. Retuning what counts as a `convention` vs. an `instruction`, or adding a new type, is a matter of editing that description text, not restructuring the code. The one wrinkle: the five type names are also referenced in the `type` filter's enum in `list_thoughts` (`src/server.js`) — if you rename or add a type, update that enum too or the new type will get rejected as a filter value. Everything's stored as a JSON blob column, so none of this needs a schema migration.
 
-Separately, every thought gets a **project** field — `null` by default (applies everywhere), or a specific project id if it's scoped to the current codebase. The calling agent only judges *whether* it's project-scoped (`projectScoped`); the actual project id is derived deterministically from the working directory — the absolute path with separators turned into dashes, e.g. `/var/www/html` → `-var-www-html`, matching the per-project directory name Claude Code itself uses under `~/.claude/projects/`. The model never names the project, so retrieval can do an exact match instead of fuzzy text comparison.
+Every thought gets a **project** field: `null` applies everywhere; otherwise it
+is the normalized absolute path prefixed by `path:`. Separators are preserved,
+so `/work/a-b` and `/work/a/b` identify different projects. The calling agent
+only decides *whether* a rule is project-scoped. Existing hyphen-based IDs
+require the explicit, backup-first project migration in [upgrading.md](docs/upgrading.md).
 
 - **Storage:** SQLite (`better-sqlite3`) + `sqlite-vec` for native vector search, FTS5 for keyword search, combined via reciprocal rank fusion. One file, no server, no daemon.
 - **Embeddings:** local, via `Xenova/bge-small-en-v1.5` (384-dim, quantized, ~130MB). Downloads once to `~/.conventions-mcp/models`, loads lazily, and needs no GPU.
@@ -59,7 +63,8 @@ conventions-mcp init-db    # creates ~/.conventions-mcp/memory.db
 conventions-mcp warmup     # downloads and verifies the embedding model
 ```
 
-Nothing to configure — there's no API key and no external service. `MEMORY_DB_PATH` is the only environment variable this reads, and it's optional (see `.env.example`).
+No API key or external service is required. Optional database, model-cache,
+transport, and timeout settings are listed in `.env.example`.
 
 Use `conventions-mcp --help` to inspect the installed commands and
 `conventions-mcp --version` to confirm which release is on PATH. See
@@ -104,9 +109,8 @@ url = "http://127.0.0.1:47123/mcp"
 http_headers_helper = "conventions-mcp codex-project-header"
 ```
 
-Codex runs the helper in the active workspace. The server converts that
-absolute path to its project identifier, so `/var/www/html` becomes
-`-var-www-html`.
+Codex runs the helper in the active workspace. The server normalizes that
+absolute path and prefixes it with `path:` for its project identifier.
 
 ## Register with Claude Code
 
@@ -125,11 +129,16 @@ Either way, this writes to `~/.claude.json`'s `mcpServers` key, which is what th
 
 ## Codex standing-rule hook
 
-`hooks/hooks.json` contains user-scoped Codex `SessionStart` and `PreToolUse` hooks. The first tells the agent to call `list_rules`; the second denies every other tool until that call happens. The gate is re-armed after `/clear` and compaction, when the loaded rules leave context. The rules themselves are not placed in hook output, so a large rule set cannot be truncated before the agent receives it from the MCP tool.
+`hooks/hooks.json` contains user-scoped Codex `SessionStart` and `PreToolUse` hooks. The first tells the agent to call `list_rules`; the second denies every other tool until that call happens. The gate is re-armed on every start, resume, `/clear`, and compaction, even if the restored conversation contains an earlier rule load. The rules themselves are not placed in hook output, so a large rule set cannot be truncated before the agent receives it from the MCP tool.
 
 Install it as `~/.codex/hooks.json`. If that file already contains hooks, merge this file's `SessionStart` and `PreToolUse` entries instead of replacing the existing configuration. The hook expects the MCP server to be registered as `conventions`, matching the setup command above, and the installed `conventions-mcp` command to be on `PATH`. Open `/hooks` once in Codex to review and trust the newly installed hooks; a new session is required before a startup hook can fire.
 
 ## Claude Code standing-rule hooks
+
+Checkout users can invoke the absolute Node executable and `bin/cli.js` path
+for Codex hooks too; see [installation](docs/install.md). A global npm copy is
+not required. Hook gates unlock on an attempted `list_rules` call, including a
+failed call; the calling agent must still handle failures and obtain the rules.
 
 Three hooks in `~/.claude/settings.json` enforce `list_rules` before tool use — the first two provide reminders, the third actually enforces it:
 
@@ -149,7 +158,7 @@ Three hooks in `~/.claude/settings.json` enforce `list_rules` before tool use �
 }
 ```
 
-- `bin/session-rules.js` fires at session start and emits a short reminder to call `list_rules` first — rather than embedding rule content in the hook output directly, which doesn't scale (a large enough stored rule set gets silently truncated to a small preview before it ever reaches the model). It also re-arms the enforcement gate after a compaction or `/clear` (the two events that drop the already-loaded rules from context), so a reload is forced then too.
+- `bin/session-rules.js` fires at session start and emits a short reminder to call `list_rules` first — rather than embedding rule content in the hook output directly, which doesn't scale (a large enough stored rule set gets silently truncated to a small preview before it ever reaches the model). Every invocation re-arms the enforcement gate, including resume, compaction, and `/clear`, so an earlier load cannot bypass the new instruction.
 - `bin/prompt-reminder.js` fires on every turn with a static reminder to follow the loaded conventions and to capture only genuinely durable rules intended for future sessions or repeated work. It explicitly excludes task-specific directions, temporary choices, current status, incident history, one-job commands, and records of how an individual job was completed.
 - `bin/pre-tool-check.js` fires before every tool call and denies it outright until `list_rules` has run this session — the first two hooks are advisory (reminders only), so this is the layer that actually enforces the requirement. It's forced once per session, not once per turn.
 
@@ -178,4 +187,6 @@ None of the three touch the database directly. `list_rules` resolves the current
 
 - If a single message states several distinct rules, `capture_thought` gets called once per rule, each relayed individually — not merged into one capture or summarized together.
 - The database lives at `data/memory.db` in a git checkout, or `~/.conventions-mcp/memory.db` for the npm package (override either with `MEMORY_DB_PATH`). It's gitignored and created with private permissions. Use `conventions-mcp backup <absolute-destination>` for a live-safe, integrity-checked backup. [`docs/shared-service.md`](docs/shared-service.md) shows a scheduled setup.
-- To upgrade embedding quality later without re-architecting, swap `MODEL_NAME` in `src/embeddings.js` — but re-embed existing thoughts if the new model's vector space isn't compatible with the old one (different models' embeddings aren't comparable, even at the same dimension).
+- The embedding model and dimension are declared in `src/storage-format.js`.
+  A model change requires an explicit storage migration that re-embeds existing
+  rules; changing the constant alone makes existing stores incompatible.

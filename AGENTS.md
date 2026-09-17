@@ -26,6 +26,9 @@ supported clients.
   the database. The database directory and files are private to the user on
   POSIX systems. `backupDatabase` uses SQLite's online backup API, verifies the
   snapshot, and publishes it atomically without overwriting an existing file.
+  Existing database parents must already be private; never chmod a caller's
+  shared directory automatically. Backup and restore staging files are created
+  exclusively with mode 0600 before SQLite writes any records.
   `app_metadata` records the storage schema, embedding model, and dimension.
   Unknown non-empty legacy stores are rejected until `migrate-storage` creates
   a verified backup and re-embeds every row; declared incompatible formats are
@@ -34,6 +37,9 @@ supported clients.
   the source and current-format metadata, makes a non-overwriting online
   rollback backup, stages the source beside the live database, and uses
   same-filesystem renames with rollback on publication failure.
+  Source staging uses SQLite's backup API so committed source WAL records are
+  included. Initialization caches a connection only after schema/format checks
+  succeed, and closes failed connections on every error path.
 - `src/load-env.js` — side-effect module loading `~/.conventions-mcp/.env` into
   `process.env` (without overriding anything already set), for entry points
   invoked without Node's own `--env-file` flag — the installed `conventions-mcp`
@@ -41,13 +47,16 @@ supported clients.
   reads `process.env` at module-load time, before importing `db.js`; ES
   module static imports evaluate in file order, so a leading import
   guarantees this runs before those reads. Nothing in this codebase requires
-  an env var — `MEMORY_DB_PATH` is the only one read, and it's optional.
+  an env var; optional database, model-cache, transport, and timeout settings
+  are listed in `.env.example`.
 - `src/embeddings.js` — local embedding model (`Xenova/bge-small-en-v1.5`,
   quantized), downloaded once, loaded lazily on first call, and held resident
   for the server process's lifetime. Its cache is persistent at
   `~/.conventions-mcp/models` unless `MEMORY_MODEL_CACHE_PATH` overrides it,
   rather than living inside an npm installation that upgrades may replace.
   No GPU or hosted inference service.
+  Concurrent callers share initialization; a rejected initialization is cleared
+  so a later call can retry without restarting the process.
   The tracked `.npmrc` sets `onnxruntime-node-install-cuda=skip`; do not remove
   it unless GPU inference is deliberately implemented and tested, because
   ONNX Runtime otherwise downloads an unused CUDA artifact on Linux x64.
@@ -79,9 +88,9 @@ supported clients.
   model. `pre-tool-check.js` is the enforcement layer: advisory instructions
   turned out to be ignorable in practice, so it denies any other tool call
   until `list_rules` has run this session, tracked by a marker file. The gate
-  fires once per session, not once per turn — `session-rules.js` re-arms it
-  (clears the marker) only after a compaction or `/clear`, the two events that
-  drop the loaded rules from context. `prompt-reminder.js` no longer touches
+  fires once per session start, not once per turn — `session-rules.js` re-arms
+  it on every start, resume, compaction, or `/clear`, including when a resumed
+  conversation retains an earlier rule load. `prompt-reminder.js` no longer touches
   the gate at all; it just re-anchors, every turn, "follow the loaded
   conventions, and capture only durable rules intended to govern future
   sessions or repeated work." Task-specific directions, temporary choices,
@@ -114,9 +123,18 @@ supported clients.
   function for deterministic tests; production entry points always use the
   real local model. HTTP integration tests must inject a 384-value embedding
   rather than downloading the model, so the suite is reproducible offline.
+  HTTP startup must reject listener errors rather than reporting success.
+  Unknown or expired session IDs return HTTP 404 to signal reinitialization;
+  missing required session IDs return HTTP 400.
+  Active tool calls suspend idle expiry. Shutdown drains both handlers and HTTP
+  responses before closing transports; forced closure cancels pending writes.
+  Roots resolution has a one-second deadline and caches the scope until a
+  roots-change notification, or for 30 seconds after a failed lookup.
 - `src/project.js` — `getCurrentProject(cwd)` derives a stable project id from
-  the working directory: the absolute path with `/` turned into `-` (e.g.
-  `/var/www/html` → `-var-www-html`). Used to stamp captures and to filter
+  the normalized absolute path prefixed by `path:`, preserving separators.
+  Legacy hyphen-based IDs require explicit `migrate-project` ownership
+  assignment with a verified backup; never infer ownership of a colliding ID.
+  Used to stamp captures and to filter
   `list_rules`, so "which project" is a deterministic lookup rather than
   free-text matching against whatever string an LLM happened to write.
 - `bin/cli.js` — the npm `"bin"` entry (`package.json`'s
@@ -198,10 +216,9 @@ but nothing stops a model from ignoring it); the third actually enforces the
 requirement by denying tool use outright:
 
 - **`SessionStart`** → `bin/session-rules.js` — emits a short reminder to call
-  `list_rules` before any other tool use this session. It also reads the
-  event's `source`: on `compact` or `clear` (the two events that discard the
-  already-loaded rules from context) it clears the enforcement marker below,
-  forcing a reload; on a plain startup/resume there's no marker to clear.
+  `list_rules` before any other tool use following this event. It clears the
+  enforcement marker on every invocation, including startup and resume, so
+  an earlier load in the restored conversation cannot bypass the reload.
 - **`UserPromptSubmit`** → `bin/prompt-reminder.js` — fires on every turn with
   a static reminder to (1) follow the conventions already loaded via
   `list_rules`, and (2) capture only a durable rule clearly meant to govern
@@ -218,8 +235,8 @@ requirement by denying tool use outright:
   a marker named with the SHA-256 hash of the session id — written the moment
   a call whose `tool_name` ends in `__list_rules` is seen (allowed
   through unconditionally, so this can't deadlock against itself), and removed
-  only by `session-rules.js` on `compact`/`clear`. So `list_rules` is forced
-  once per session and again after each context reset, not once per turn. The
+  by `session-rules.js` on every SessionStart. So `list_rules` is forced
+  on start, resume, and context reset, not once per turn. The
   gate keys on *attempt*, not success — even a `list_rules` call that errors
   at runtime still sets the marker, since `PreToolUse` fires before the
   underlying tool executes.
@@ -268,7 +285,9 @@ CLI help/version entry point from the resulting installed-package layout.
 Native dependency installation is already exercised by `npm ci`; a separate
 network-enabled release check remains responsible for registry resolution and
 npm-generated bin links.
-The manual publish workflow performs that final check against the exact
+The publish workflow runs on main-branch pushes changing package.json, or a
+manual dispatch on main. It skips versions already present in npm and fails
+closed if the registry lookup fails. It performs the final check against the exact
 tarball, runs its generated executable and `doctor` from a clean global prefix,
 and publishes that same tarball only after validation succeeds.
 
@@ -321,9 +340,8 @@ http_headers_helper = "conventions-mcp codex-project-header"
 
 Codex runs `http_headers_helper` in the active workspace. The helper sends that
 absolute working directory as `X-Conventions-Project`; the server then converts
-slashes to dashes for its project identifier, so `/var/www/html` is presented
-as `-var-www-html`. Without the helper, a shared HTTP connection has no Codex
-workspace root and receives only global rules. Install the bundled
+the normalized path to a `path:` project identifier. Without the helper, a
+client that supplies no workspace root receives only global rules. Install the bundled
 `hooks/hooks.json` as described under "Standing-rule hooks" and start a new
 Codex session so the MCP and hook configuration are loaded.
 
@@ -339,8 +357,7 @@ either way, and hooks are registered identically regardless of path:
    - **Git checkout:** from the project root, `npm install`.
    - **npm install:** `npm install -g conventions-mcp --onnxruntime-node-install-cuda=skip`.
    No config to set — there's no API key and no external service.
-   `MEMORY_DB_PATH` is the only environment variable this reads, and it's
-   optional (see `.env.example`).
+   Optional environment settings are listed in `.env.example`.
 2. Create the database.
    - **Git checkout:** `npm run init-db` → `data/memory.db`.
    - **npm install:** `conventions-mcp init-db` → resolves automatically to
@@ -409,7 +426,7 @@ either way, and hooks are registered identically regardless of path:
    "Personal memory" section if you want to remind yourself what the hooks do,
    but it's not required — the enforcement is in the `PreToolUse` hook itself,
    which will deny any tool call until `list_rules` has been attempted that
-   session, or since the last compaction or `/clear`.
+   session start, resume, compaction, or `/clear`.
 6. Tell the user a **new Claude Code session** is required to pick up a
    newly-registered MCP server or new hooks — config changes made mid-session
    aren't visible to the session that just edited them. If the settings

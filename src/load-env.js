@@ -1,10 +1,7 @@
 // Side-effect module: loads ~/.conventions-mcp/.env into process.env, without
 // overriding anything already set — a real shell env var or Node's own
 // --env-file flag always wins. Only meaningful for installed use (the
-// `conventions-mcp` bin command, or a hook script run standalone): a git
-// checkout's `npm run` scripts already get their env from --env-file=.env
-// before any script code runs, so this is a no-op there unless the file
-// happens to exist too.
+// `conventions-mcp` bin command). Checkout entry points use the same loader.
 //
 // Import this FIRST in any entry point that reads process.env at module
 // load time (db.js's DB_PATH) — ES module static imports evaluate in order,

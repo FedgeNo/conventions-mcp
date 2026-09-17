@@ -1,7 +1,14 @@
 name: Publish Package
 
 on:
+  push:
+    branches: [main]
+    paths: [package.json]
   workflow_dispatch:
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
 
 permissions:
   id-token: write
@@ -9,6 +16,7 @@ permissions:
 
 jobs:
   publish:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -17,21 +25,42 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
+      - id: release
+        name: Check whether this version is unpublished
+        shell: bash
+        run: |
+          name=$(node -p 'require("./package.json").name')
+          npm view "$name" versions --json > "$RUNNER_TEMP/published-versions.json"
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          const { version } = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const published = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/published-versions.json`, 'utf8'));
+          if (!Array.isArray(published) || !published.every(v => typeof v === 'string')) throw new Error('Unexpected registry response');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `needed=${!published.includes(version)}\n`);
+          console.log(`${version}: ${published.includes(version) ? 'already published; skipping' : 'new version'}`);
+          JS
       - run: npm ci
+        if: steps.release.outputs.needed == 'true'
         env:
           ONNXRUNTIME_NODE_INSTALL_CUDA: skip
       - run: npm run check:docs
+        if: steps.release.outputs.needed == 'true'
       - run: npm test
+        if: steps.release.outputs.needed == 'true'
       - run: npm run test:package
+        if: steps.release.outputs.needed == 'true'
       - name: Audit production dependencies
-        run: npm audit --omit=dev --audit-level=critical
+        if: steps.release.outputs.needed == 'true'
+        run: npm audit --omit=dev --audit-level=high
       - id: pack
+        if: steps.release.outputs.needed == 'true'
         name: Build release tarball
         shell: bash
         run: |
           tarball=$(npm pack --json | node -e 'let input=""; process.stdin.on("data", c => input += c); process.stdin.on("end", () => process.stdout.write(JSON.parse(input)[0].filename))')
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
       - name: Install and validate release tarball
+        if: steps.release.outputs.needed == 'true'
         shell: bash
         env:
           ONNXRUNTIME_NODE_INSTALL_CUDA: skip
@@ -44,3 +73,4 @@ jobs:
             MEMORY_MODEL_CACHE_PATH="$prefix/models" \
             "$prefix/bin/conventions-mcp" doctor
       - run: npm publish "./${{ steps.pack.outputs.tarball }}"
+        if: steps.release.outputs.needed == 'true'

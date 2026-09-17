@@ -8,6 +8,9 @@ test("shutdown timeout validation accepts defaults and safe configured values", 
   assert.equal(parseShutdownTimeout("2500"), 2_500);
   assert.throws(() => parseShutdownTimeout("999"), /at least 1000/);
   assert.throws(() => parseShutdownTimeout("1second"), /safe integer/);
+  assert.equal(parseShutdownTimeout("2147483647"), 2147483647);
+  assert.throws(() => parseShutdownTimeout("2147483648"), /at most 2147483647/);
+  assert.throws(() => parseShutdownTimeout("9007199254740992"), /at most 2147483647/);
 });
 
 test("bounded shutdown completes tasks before closing the database", async () => {

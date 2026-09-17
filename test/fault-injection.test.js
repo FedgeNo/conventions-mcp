@@ -56,3 +56,15 @@ test("corrupt thought metadata fails visibly instead of being silently ignored",
   database.prepare("INSERT INTO thoughts (content, metadata) VALUES (?, ?)").run("Corrupt row", "not-json");
   assert.throws(() => dbModule.listThoughts(), /JSON/);
 });
+
+test("checkpoint failure still closes the connection and permits a clean reopen", () => {
+  const database = dbModule.getDb({ allowLegacy: true });
+  // Restore format metadata in this isolated fixture before reopening it.
+  for (const [key, value] of [["schema_version", "1"], ["embedding_model", "Xenova/bge-small-en-v1.5"], ["embedding_dimension", "384"]]) {
+    database.prepare("INSERT INTO app_metadata(key, value) VALUES (?, ?)").run(key, value);
+  }
+  database.pragma = () => { throw new Error("injected checkpoint failure"); };
+  assert.throws(() => dbModule.closeDb(), /checkpoint failure/);
+  assert.equal(database.open, false);
+  assert.equal(dbModule.getDb().open, true);
+});

@@ -124,6 +124,19 @@ http_headers_helper = "conventions-mcp codex-project-header"
 Merge `hooks/hooks.json` into `~/.codex/hooks.json`, preserving existing hooks,
 and review it with `/hooks`. Start a new session afterward.
 
+For a checkout, replace each hook's leading `conventions-mcp` command with the
+absolute Node executable and checkout CLI path, both quoted. For example:
+
+```json
+{"command":"\"/absolute/path/to/node\" \"/absolute/path/to/checkout/bin/cli.js\" hook-session-rules"}
+```
+
+Apply the same prefix to `hook-pre-tool-check`, the workspace-header helper,
+and any scheduled CLI commands. Do not install a second npm copy to satisfy
+these paths. Before switching an existing setup, verify its service command,
+hook commands, and explicit MEMORY_DB_PATH together. Keep the old hook command
+available until the client reloads its configuration.
+
 ### Other MCP clients
 
 Other clients can use the stdio command pair or HTTP URL above. The bundled

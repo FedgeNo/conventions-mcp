@@ -7,13 +7,8 @@
 // model ignores this directive and reaches for a tool without having loaded
 // the rules, that hook blocks the call until it does.
 //
-// SessionStart also fires after compaction (source "compact") and after
-// /clear (source "clear") — both of which discard the already-loaded rule
-// text from context. In those two cases this hook also clears the per-session
-// "rules already loaded" marker that pre-tool-check.js reads, so the model is
-// forced to reload the list before any further tool use. On a fresh startup
-// there is no marker yet, and on resume/fork the rules are still present in
-// the restored transcript, so no clearing is needed there.
+// A resumed session can retain its marker across client and server restarts.
+// Re-arm on every SessionStart so that retained state cannot bypass a reload.
 //
 // The marker is keyed by session_id, matching pre-tool-check.js.
 //
@@ -33,19 +28,14 @@ process.stdin.on("end", () => {
     // Malformed input — still emit the directive, just can't scope the marker.
   }
 
-  // After compaction or /clear the loaded rules are gone from context, so
-  // re-arm the gate to force a reload. Other sources don't need it: startup
-  // has no marker, and resume/fork keep the rules in the restored transcript.
-  if (payload.source === "compact" || payload.source === "clear") {
-    clearRulesLoaded(payload.session_id);
-  }
+  clearRulesLoaded(payload.session_id);
 
   process.stdout.write(
     JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "SessionStart",
         additionalContext:
-          "Before your first tool call in this session, call mcp__conventions__list_rules once to load this project's standing conventions. Do not call it again unless context has been reset.",
+          "This session has just started, resumed, or reset. Before your next tool call, call mcp__conventions__list_rules to reload this project's standing conventions, even if an earlier call appears in the restored conversation. Do not call it again until another SessionStart instruction or context reset.",
       },
     })
   );

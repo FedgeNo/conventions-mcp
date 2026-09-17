@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { EMBEDDING_DIMENSION, STORAGE_METADATA } from "./storage-format.js";
+import { getCurrentProject, legacyProject } from "./project.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -34,18 +35,32 @@ export function getDb({ allowLegacy = false, allowRestore = false } = {}) {
 
   const directory = path.dirname(DB_PATH);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  if (process.platform !== "win32") fs.chmodSync(directory, 0o700);
-  db = new Database(DB_PATH);
-  if (process.platform !== "win32") fs.chmodSync(DB_PATH, 0o600);
-  sqliteVec.load(db);
-  db.pragma("journal_mode = WAL");
-  db.pragma("synchronous = FULL");
-  db.pragma("busy_timeout = 5000");
-  db.pragma("wal_autocheckpoint = 100");
-  db.pragma("foreign_keys = ON");
-  db.pragma("secure_delete = ON");
+  if (process.platform !== "win32" && (fs.statSync(directory).mode & 0o077) !== 0) {
+    throw new Error("Database directory must be private (0700); choose a dedicated private directory or explicitly repair its permissions");
+  }
+  const database = new Database(DB_PATH);
+  try {
+    initializeDatabase(database, { allowLegacy });
+    db = database;
+    return db;
+  } catch (error) {
+    if (database.open) database.close();
+    throw error;
+  }
+}
 
-  db.exec(`
+function initializeDatabase(database, { allowLegacy }) {
+  sqliteVec.load(database);
+  validateSchema(database);
+  if (process.platform !== "win32") fs.chmodSync(DB_PATH, 0o600);
+  database.pragma("journal_mode = WAL");
+  database.pragma("synchronous = FULL");
+  database.pragma("busy_timeout = 5000");
+  database.pragma("wal_autocheckpoint = 100");
+  database.pragma("foreign_keys = ON");
+  database.pragma("secure_delete = ON");
+
+  database.exec(`
     CREATE TABLE IF NOT EXISTS thoughts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       content TEXT NOT NULL,
@@ -82,9 +97,16 @@ export function getDb({ allowLegacy = false, allowRestore = false } = {}) {
     );
   `);
 
-  validateStorageMetadata(db, { allowLegacy });
+  validateStorageMetadata(database, { allowLegacy });
+}
 
-  return db;
+function validateSchema(database) {
+  for (const [table, required] of [["thoughts", ["id", "content", "metadata"]], ["app_metadata", ["key", "value"]]]) {
+    const columns = database.prepare(`PRAGMA table_info(${table})`).all();
+    if (columns.length && required.some(name => !columns.some(column => column.name === name))) {
+      throw new Error(`Incompatible ${table} schema: expected columns ${required.join(", ")}`);
+    }
+  }
 }
 
 function validateStorageMetadata(database, { allowLegacy = false } = {}) {
@@ -93,16 +115,12 @@ function validateStorageMetadata(database, { allowLegacy = false } = {}) {
     const { count } = database.prepare("SELECT COUNT(*) AS count FROM thoughts").get();
     if (count === 0) writeStorageMetadata(database);
     else if (!allowLegacy) {
-      database.close();
-      db = undefined;
       throw new Error("Legacy storage has no format metadata; run conventions-mcp migrate-storage <absolute-backup-path>");
     }
   } else {
     const actual = Object.fromEntries(metadataRows.map(({ key, value }) => [key, value]));
     for (const [key, expected] of Object.entries(STORAGE_METADATA)) {
       if (actual[key] !== expected) {
-        database.close();
-        db = undefined;
         throw new Error(`Incompatible storage ${key}: found ${actual[key] ?? "missing"}, expected ${expected}`);
       }
     }
@@ -137,6 +155,7 @@ function verifyDatabaseFile(filename) {
   const candidate = new Database(filename, { readonly: true, fileMustExist: true });
   try {
     sqliteVec.load(candidate);
+    validateSchema(candidate);
     const integrity = candidate.pragma("integrity_check", { simple: true });
     if (integrity !== "ok") throw new Error(`Integrity check failed: ${integrity}`);
     validateStorageMetadata(candidate);
@@ -166,8 +185,14 @@ export async function restoreDatabase(source, rollbackDestination) {
     verifyDatabaseFile(source);
     await backupDatabase(rollbackDestination, { allowRestore: true });
     closeDb();
-    fs.copyFileSync(source, temporary, fs.constants.COPYFILE_EXCL);
-    if (process.platform !== "win32") fs.chmodSync(temporary, 0o600);
+    fs.closeSync(fs.openSync(temporary, "wx", 0o600));
+    const sourceDatabase = new Database(source, { readonly: true, fileMustExist: true });
+    try {
+      sqliteVec.load(sourceDatabase);
+      await sourceDatabase.backup(temporary);
+    } finally {
+      sourceDatabase.close();
+    }
     verifyDatabaseFile(temporary);
 
     fs.renameSync(DB_PATH, displaced);
@@ -192,9 +217,10 @@ export async function restoreDatabase(source, rollbackDestination) {
 
 export function closeDb() {
   if (!db) return;
-  db.pragma("wal_checkpoint(TRUNCATE)");
-  db.close();
+  const closing = db;
   db = undefined;
+  try { closing.pragma("wal_checkpoint(TRUNCATE)"); }
+  finally { closing.close(); }
 }
 
 export async function backupDatabase(destination, { allowRestore = false } = {}) {
@@ -205,10 +231,13 @@ export async function backupDatabase(destination, { allowRestore = false } = {})
   const directory = path.dirname(destination);
   const directoryExists = fs.existsSync(directory);
   const temporary = `${destination}.tmp-${randomUUID()}`;
+  let created = false;
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   if (!directoryExists && process.platform !== "win32") fs.chmodSync(directory, 0o700);
 
   try {
+    fs.closeSync(fs.openSync(temporary, "wx", 0o600));
+    created = true;
     await database.backup(temporary);
     const backup = new Database(temporary, { readonly: true, fileMustExist: true });
     try {
@@ -225,7 +254,7 @@ export async function backupDatabase(destination, { allowRestore = false } = {})
     fs.unlinkSync(temporary);
   } catch (error) {
     try {
-      fs.unlinkSync(temporary);
+      if (created) fs.unlinkSync(temporary);
     } catch {
       // The temporary file may not have been created.
     }
@@ -249,6 +278,7 @@ function toVecBuffer(embedding) {
 
 export function insertThought({ content, metadata, embedding }) {
   const database = getDb();
+  requireProjectMigration(database, metadata?.project);
   const insertThoughtStmt = database.prepare(
     "INSERT INTO thoughts (content, metadata) VALUES (?, ?)"
   );
@@ -275,6 +305,7 @@ export function insertThought({ content, metadata, embedding }) {
 // embedding row is deleted and reinserted rather than updated in place.
 export function updateThought(id, { content, metadata, embedding }) {
   const database = getDb();
+  requireProjectMigration(database, metadata?.project);
   const updateThoughtStmt = database.prepare(
     "UPDATE thoughts SET content = ?, metadata = ? WHERE id = CAST(? AS INTEGER)"
   );
@@ -322,17 +353,19 @@ export function deleteThought(id) {
 // matches, which pure vector search alone misses.
 export function hybridSearch({ queryEmbedding, queryText, limit = 10, k = 60, project = null }) {
   const database = getDb();
+  requireProjectMigration(database, project);
   const { count } = database.prepare("SELECT COUNT(*) AS count FROM thoughts").get();
   if (count === 0) return [];
 
   const vecResults = database
     .prepare(
-      `SELECT thought_id, distance
-       FROM thoughts_vec
-       WHERE embedding MATCH ? AND k = ?
-       ORDER BY distance`
+      `SELECT v.thought_id, t.content, t.metadata, vec_distance_L2(v.embedding, ?) AS distance
+       FROM thoughts_vec v JOIN thoughts t ON t.id = v.thought_id
+       WHERE json_extract(t.metadata, '$.project') IS NULL
+          OR json_extract(t.metadata, '$.project') = ?
+       ORDER BY distance, v.thought_id`
     )
-    .all(toVecBuffer(queryEmbedding), count);
+    .all(toVecBuffer(queryEmbedding), project);
 
   // A query of nothing but stripped punctuation yields an empty MATCH
   // expression, which FTS5 rejects as a syntax error — fall back to
@@ -341,13 +374,14 @@ export function hybridSearch({ queryEmbedding, queryText, limit = 10, k = 60, pr
   const ftsResults = matchQuery
     ? database
         .prepare(
-          `SELECT rowid AS thought_id, rank
-           FROM thoughts_fts
+          `SELECT thoughts_fts.rowid AS thought_id, rank
+           FROM thoughts_fts JOIN thoughts t ON t.id = thoughts_fts.rowid
            WHERE thoughts_fts MATCH ?
-           ORDER BY rank
-           LIMIT ?`
+             AND (json_extract(t.metadata, '$.project') IS NULL
+               OR json_extract(t.metadata, '$.project') = ?)
+           ORDER BY rank, thoughts_fts.rowid`
         )
-        .all(matchQuery, count)
+        .all(matchQuery, project)
     : [];
 
   const scores = new Map(); // thought_id -> reciprocal rank fusion score
@@ -364,12 +398,7 @@ export function hybridSearch({ queryEmbedding, queryText, limit = 10, k = 60, pr
 
   if (rankedIds.length === 0) return [];
 
-  const placeholders = rankedIds.map(() => "?").join(",");
-  const rows = database
-    .prepare(`SELECT id, content, metadata FROM thoughts WHERE id IN (${placeholders})`)
-    .all(...rankedIds);
-
-  const byId = new Map(rows.map((r) => [r.id, r]));
+  const byId = new Map(vecResults.map(({ thought_id: id, content, metadata }) => [id, { id, content, metadata }]));
   return rankedIds
     .map((id) => byId.get(id))
     .filter(Boolean)
@@ -407,6 +436,7 @@ export function listThoughts({ type } = {}) {
 // latency or ranking uncertainty.
 export function listRules({ project } = {}) {
   const database = getDb();
+  requireProjectMigration(database, project);
   const rows = database
     .prepare(
       `SELECT id, content, metadata FROM thoughts
@@ -417,6 +447,24 @@ export function listRules({ project } = {}) {
     .all(project ?? null);
 
   return rows.map((r) => ({ ...r, metadata: JSON.parse(r.metadata) }));
+}
+
+function requireProjectMigration(database, project) {
+  const legacy = project ? legacyProject(project) : null;
+  if (legacy && database.prepare("SELECT 1 FROM thoughts WHERE json_extract(metadata, '$.project') = ? LIMIT 1").get(legacy)) {
+    throw new Error("Legacy project rules require an explicit scope migration: run conventions-mcp migrate-project <absolute-project-path> <absolute-backup-path>. Review ownership before migrating; legacy path identifiers can collide.");
+  }
+}
+
+export async function migrateProjectScope(projectPath, backupPath) {
+  if (!path.isAbsolute(projectPath) && !path.win32.isAbsolute(projectPath)) throw new Error("Project path must be absolute");
+  const project = getCurrentProject(projectPath);
+  const legacy = legacyProject(project);
+  const database = getDb();
+  const count = database.prepare("SELECT count(*) AS count FROM thoughts WHERE json_extract(metadata, '$.project') = ?").get(legacy).count;
+  if (!count) return 0;
+  await backupDatabase(backupPath);
+  return database.transaction(() => database.prepare("UPDATE thoughts SET metadata = json_set(metadata, '$.project', ?) WHERE json_extract(metadata, '$.project') = ?").run(project, legacy).changes)();
 }
 
 export function thoughtStats() {

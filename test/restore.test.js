@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 import Database from "better-sqlite3";
+import * as sqliteVec from "sqlite-vec";
 
 const directory = await mkdtemp(path.join(os.tmpdir(), "conventions-restore-test-"));
 process.env.MEMORY_DB_PATH = path.join(directory, "memory.db");
@@ -55,5 +56,28 @@ test("restore refuses a database with live SQLite sidecars", async () => {
     );
   } finally {
     fs.unlinkSync(sidecar);
+  }
+});
+
+test("restore includes committed source WAL records", async () => {
+  const source = path.join(directory, "wal-source.db");
+  await dbModule.backupDatabase(source);
+  dbModule.closeDb();
+  const writer = new Database(source);
+  sqliteVec.load(writer);
+  writer.pragma("journal_mode = WAL");
+  writer.pragma("wal_autocheckpoint = 0");
+  try {
+    writer.transaction(() => {
+      const id = writer.prepare("INSERT INTO thoughts(content, metadata) VALUES (?, ?)")
+        .run("Committed in source WAL", '{}').lastInsertRowid;
+      writer.prepare("INSERT INTO thoughts_vec(thought_id, embedding) VALUES(CAST(? AS INTEGER), ?)")
+        .run(id, Buffer.from(new Float32Array(384).buffer));
+    })();
+    assert.equal(fs.existsSync(`${source}-wal`), true);
+    await dbModule.restoreDatabase(source, path.join(directory, "wal-rollback.db"));
+    assert.equal(dbModule.listThoughts().some(row => row.content === "Committed in source WAL"), true);
+  } finally {
+    writer.close();
   }
 });

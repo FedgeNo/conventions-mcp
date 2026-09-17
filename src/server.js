@@ -18,7 +18,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { isInitializeRequest, RootsListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 import { embed } from "./embeddings.js";
@@ -33,15 +33,26 @@ const { version: PACKAGE_VERSION } = require("../package.json");
 // (projectScoped); this stamps *which* project deterministically from cwd,
 // replacing the boolean in stored metadata so retrieval can do an exact
 // `project` match instead of re-deriving it.
+const projectResolutions = new WeakMap();
 async function getSessionProject(server, fallback_project_path) {
+  const cached = projectResolutions.get(server);
+  if (cached && cached.expires > Date.now()) return cached.promise;
+  const resolution = { expires: Infinity };
+  resolution.promise = resolveSessionProject(server, fallback_project_path, resolution);
+  projectResolutions.set(server, resolution);
+  return resolution.promise;
+}
+
+async function resolveSessionProject(server, fallback_project_path, resolution) {
   try {
     if (server.server.getClientCapabilities()?.roots) {
-      const { roots } = await server.server.listRoots();
+      const { roots } = await server.server.listRoots(undefined, { timeout: 1000 });
       const root = roots.find(({ uri }) => uri.startsWith("file:"));
       if (root) return getCurrentProject(fileURLToPath(root.uri));
     }
-  } catch {
-    // Clients are not required to implement roots; preserve the cwd behavior.
+  } catch (error) {
+    resolution.expires = Date.now() + 30_000;
+    console.error(`MCP roots unavailable; using configured project fallback: ${error.message}`);
   }
 
   return fallback_project_path ? getCurrentProject(fallback_project_path) : null;
@@ -86,13 +97,31 @@ const CLASSIFICATION_FIELDS = {
 const SERVER_INSTRUCTIONS =
   "Store only durable conventions, standing instructions, corrections, and preferences that should affect future work. Never capture task-specific directions, temporary choices, current status, incident history, commands used for one job, or how an individual job happened to be completed. A direction that applies only to the current request belongs in conversation context, not this store. Capture it only when the user clearly states or confirms that it should govern future sessions or repeated work.";
 
-export function createConventionsServer(fallback_project_path = process.cwd(), embedFunction = embed) {
+export function createConventionsServer(fallback_project_path = process.cwd(), embedFunction = embed, lifecycle = {}) {
   const server = new McpServer(
     { name: "conventions-mcp", version: PACKAGE_VERSION },
     { instructions: SERVER_INSTRUCTIONS }
   );
 
-  server.registerTool(
+  const pendingTools = new Set();
+  server.server.setNotificationHandler(RootsListChangedNotificationSchema, () => projectResolutions.delete(server));
+  let stopping = false;
+  server.drainTools = async () => {
+    stopping = true;
+    await Promise.allSettled([...pendingTools]);
+  };
+  const registerTool = (name, config, handler) => server.registerTool(name, config, (args, extra) => {
+    if (stopping) return { content: [{ type: "text", text: "Server is shutting down; retry after reconnecting." }], isError: true };
+    lifecycle.active?.();
+    const operation = Promise.resolve().then(() => handler(args, extra));
+    pendingTools.add(operation);
+    return operation.finally(() => {
+      pendingTools.delete(operation);
+      if (pendingTools.size === 0) lifecycle.idle?.();
+    });
+  });
+
+  registerTool(
     "capture_thought",
     {
       title: "Capture Convention or Instruction",
@@ -107,10 +136,11 @@ export function createConventionsServer(fallback_project_path = process.cwd(), e
         ...CLASSIFICATION_FIELDS,
       },
     },
-    async ({ content, type, topics, projectScoped }) => {
+    async ({ content, type, topics, projectScoped }, { signal }) => {
       try {
         const embedding = await embedFunction(content);
         const metadata = await withProjectStamp(server, fallback_project_path, { type, topics, projectScoped });
+        signal.throwIfAborted();
         const id = insertThought({ content, metadata, embedding });
         return { content: [{ type: "text", text: formatConfirmation("Captured", id, content, metadata) }] };
       } catch (err) {
@@ -119,7 +149,7 @@ export function createConventionsServer(fallback_project_path = process.cwd(), e
     }
   );
 
-  server.registerTool(
+  registerTool(
     "update_thought",
     {
       title: "Update a Captured Thought",
@@ -133,10 +163,11 @@ export function createConventionsServer(fallback_project_path = process.cwd(), e
         ...CLASSIFICATION_FIELDS,
       },
     },
-    async ({ id, content, type, topics, projectScoped }) => {
+    async ({ id, content, type, topics, projectScoped }, { signal }) => {
       try {
         const embedding = await embedFunction(content);
         const metadata = await withProjectStamp(server, fallback_project_path, { type, topics, projectScoped });
+        signal.throwIfAborted();
         const updated = updateThought(id, { content, metadata, embedding });
         if (!updated) {
           return { content: [{ type: "text", text: `No thought found with id #${id} — nothing updated.` }] };
@@ -148,7 +179,7 @@ export function createConventionsServer(fallback_project_path = process.cwd(), e
     }
   );
 
-  server.registerTool(
+  registerTool(
     "delete_thought",
     {
       title: "Delete a Captured Thought",
@@ -171,7 +202,7 @@ export function createConventionsServer(fallback_project_path = process.cwd(), e
     }
   );
 
-  server.registerTool(
+  registerTool(
     "search_thoughts",
     {
       title: "Search Conventions and Instructions",
@@ -212,7 +243,7 @@ export function createConventionsServer(fallback_project_path = process.cwd(), e
     }
   );
 
-  server.registerTool(
+  registerTool(
     "list_thoughts",
     {
       title: "List Conventions and Instructions",
@@ -232,7 +263,8 @@ export function createConventionsServer(fallback_project_path = process.cwd(), e
           .map((t) => {
             const m = t.metadata || {};
             const tags = m.topics?.length ? " - " + m.topics.join(", ") : "";
-            return `#${t.id} (${m.type || "??"}${tags})\n   ${t.content}`;
+            const scope = m.project ? `, project: ${m.project}` : ", global";
+            return `#${t.id} (${m.type || "??"}${scope}${tags})\n   ${t.content}`;
           })
           .join("\n\n");
 
@@ -243,7 +275,7 @@ export function createConventionsServer(fallback_project_path = process.cwd(), e
     }
   );
 
-  server.registerTool(
+  registerTool(
     "list_rules",
     {
       title: "List All Standing Rules",
@@ -274,7 +306,7 @@ export function createConventionsServer(fallback_project_path = process.cwd(), e
     }
   );
 
-  server.registerTool(
+  registerTool(
     "thought_stats",
     {
       title: "Thought Statistics",
@@ -326,9 +358,12 @@ export async function runStdioServer() {
     if (stopping) return;
     stopping = true;
     const clean = await runBoundedShutdown({
-      tasks: [() => server.close()],
+      tasks: [async () => { await server.drainTools(); await server.close(); }],
       timeoutMs: shutdownTimeoutMs,
-      force: () => process.stdin.destroy(),
+      force: () => {
+        void server.close().catch(error => console.error(error.message));
+        process.stdin.destroy();
+      },
       closeDatabase: closeDb,
       logError: console.error,
     });
@@ -356,10 +391,11 @@ export async function runHTTPServer({ embedFunction = embed } = {}) {
   if (!/^\d+$/.test(maxSessionsText) || !Number.isInteger(maxSessions) || maxSessions < 1) {
     throw new Error("MCP_HTTP_MAX_SESSIONS must be a positive integer");
   }
-  if (!/^\d+$/.test(sessionIdleMsText) || !Number.isInteger(sessionIdleMs) || sessionIdleMs < 1_000) {
-    throw new Error("MCP_HTTP_SESSION_IDLE_MS must be an integer of at least 1000");
+  if (!/^\d+$/.test(sessionIdleMsText) || !Number.isSafeInteger(sessionIdleMs) || sessionIdleMs < 1_000 || sessionIdleMs > 2_147_483_647) {
+    throw new Error("MCP_HTTP_SESSION_IDLE_MS must be an integer of at least 1000 and at most 2147483647");
   }
   const sessions = new Map();
+  const pendingResponses = new Set();
   let pendingSessions = 0;
   const app = createMcpExpressApp({ host });
 
@@ -372,6 +408,7 @@ export async function runHTTPServer({ embedFunction = embed } = {}) {
 
   const refreshSession = (sessionId, session) => {
     clearTimeout(session.idleTimer);
+    if (session.busy) return;
     session.idleTimer = setTimeout(async () => {
       removeSession(sessionId);
       await session.server.close().catch((error) => {
@@ -391,6 +428,12 @@ export async function runHTTPServer({ embedFunction = embed } = {}) {
   });
 
   app.post("/mcp", async (request, response) => {
+    const completion = new Promise(resolve => {
+      response.once("finish", resolve);
+      response.once("close", resolve);
+    });
+    pendingResponses.add(completion);
+    completion.then(() => pendingResponses.delete(completion));
     const session_id = request.headers["mcp-session-id"];
     let session = typeof session_id === "string" ? sessions.get(session_id) : null;
     let hasSessionReservation = false;
@@ -412,10 +455,21 @@ export async function runHTTPServer({ embedFunction = embed } = {}) {
         (path.isAbsolute(project_header) || path.win32.isAbsolute(project_header))
           ? project_header
           : null;
-      const server = createConventionsServer(project_path, embedFunction);
+      let currentSessionId;
+      const server = createConventionsServer(project_path, embedFunction, {
+        active: () => {
+          const current = sessions.get(currentSessionId);
+          if (current) { current.busy = true; clearTimeout(current.idleTimer); }
+        },
+        idle: () => {
+          const current = sessions.get(currentSessionId);
+          if (current) { current.busy = false; refreshSession(currentSessionId, current); }
+        },
+      });
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (new_session_id) => {
+          currentSessionId = new_session_id;
           const newSession = { server, transport, idleTimer: null };
           sessions.set(new_session_id, newSession);
           refreshSession(new_session_id, newSession);
@@ -436,10 +490,10 @@ export async function runHTTPServer({ embedFunction = embed } = {}) {
     }
 
     if (!session) {
-      response.status(400).json({
+      response.status(session_id ? 404 : 400).json({
         jsonrpc: "2.0",
         error: { code: -32000, message: "Invalid or missing MCP session ID" },
-        id: null,
+        id: request.body?.id ?? null,
       });
       return;
     }
@@ -456,7 +510,7 @@ export async function runHTTPServer({ embedFunction = embed } = {}) {
     const session_id = request.headers["mcp-session-id"];
     const session = typeof session_id === "string" ? sessions.get(session_id) : null;
     if (!session) {
-      response.status(400).send("Invalid or missing MCP session ID");
+      response.status(session_id ? 404 : 400).send("Invalid or missing MCP session ID");
       return;
     }
     refreshSession(session_id, session);
@@ -467,16 +521,20 @@ export async function runHTTPServer({ embedFunction = embed } = {}) {
     const session_id = request.headers["mcp-session-id"];
     const session = typeof session_id === "string" ? sessions.get(session_id) : null;
     if (!session) {
-      response.status(400).send("Invalid or missing MCP session ID");
+      response.status(session_id ? 404 : 400).send("Invalid or missing MCP session ID");
       return;
     }
     refreshSession(session_id, session);
     await session.transport.handleRequest(request, response);
   });
 
-  const http_server = app.listen(port, host, () => {
-    console.error(`Conventions MCP listening at http://${host}:${port}/mcp`);
+  const http_server = await new Promise((resolve, reject) => {
+    const listener = app.listen(port, host, (error) => {
+      if (error) reject(error);
+      else resolve(listener);
+    });
   });
+  console.error(`Conventions MCP listening at http://${host}:${port}/mcp`);
 
   let stopping = false;
   const shutdown = async () => {
@@ -486,13 +544,24 @@ export async function runHTTPServer({ embedFunction = embed } = {}) {
     http_server.closeIdleConnections();
     const clean = await runBoundedShutdown({
       tasks: [
-        ...[...sessions.values()].map(({ server }) => () => server.close()),
+        async () => {
+          const servers = [...sessions.values()].map(({ server }) => server);
+          await Promise.all(servers.map(server => server.drainTools()));
+          await Promise.all([...pendingResponses]);
+          await Promise.all(servers.map(server => server.close()));
+          http_server.closeIdleConnections();
+        },
         () => new Promise((resolve, reject) =>
           http_server.close((error) => (error ? reject(error) : resolve()))
         ),
       ],
       timeoutMs: shutdownTimeoutMs,
-      force: () => http_server.closeAllConnections(),
+      force: () => {
+        for (const { server } of sessions.values()) {
+          void server.close().catch(error => console.error(error.message));
+        }
+        http_server.closeAllConnections();
+      },
       closeDatabase: closeDb,
       logError: console.error,
     });

@@ -43,11 +43,16 @@ test("hook state is session-scoped, re-armed, and confined to a private director
     );
     assert.deepEqual(await runHook(preTool, { session_id: sessionId, tool_name: "Read" }, environment), {});
 
-    const sessionReminder = await runHook(session, { session_id: sessionId, source: "compact" }, environment);
-    assert.match(sessionReminder.hookSpecificOutput.additionalContext, /first tool call in this session/);
-    assert.match(sessionReminder.hookSpecificOutput.additionalContext, /Do not call it again/);
-    const deniedAgain = await runHook(preTool, { session_id: sessionId, tool_name: "Read" }, environment);
-    assert.equal(deniedAgain.hookSpecificOutput.permissionDecision, "deny");
+    for (const source of ["startup", "resume", "compact", "clear"]) {
+      await runHook(preTool, { session_id: sessionId, tool_name: "mcp__conventions__list_rules" }, environment);
+      const sessionReminder = await runHook(session, { session_id: sessionId, source }, environment);
+      assert.match(sessionReminder.hookSpecificOutput.additionalContext, /Before your next tool call/);
+      assert.match(sessionReminder.hookSpecificOutput.additionalContext, /even if an earlier call appears/);
+      const deniedAgain = await runHook(preTool, { session_id: sessionId, tool_name: "Read" }, environment);
+      assert.equal(deniedAgain.hookSpecificOutput.permissionDecision, "deny", source);
+      await runHook(preTool, { session_id: sessionId, tool_name: "mcp__conventions__list_rules" }, environment);
+      assert.deepEqual(await runHook(preTool, { session_id: sessionId, tool_name: "Read" }, environment), {});
+    }
 
     const entries = await import("node:fs/promises").then(({ readdir }) => readdir(directory, { recursive: true }));
     assert.equal(entries.some((entry) => entry.includes("..") || entry.includes("untrusted")), false);

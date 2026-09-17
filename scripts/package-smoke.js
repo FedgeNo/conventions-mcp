@@ -24,6 +24,12 @@ try {
   await extractTarball({ file: tarball, cwd: temporary });
   const packageRoot = path.join(temporary, "package");
   const packageJson = JSON.parse(await readFile(path.join(packageRoot, "package.json"), "utf8"));
+  const locked = JSON.parse(await readFile(path.join(repository, "package-lock.json"), "utf8"));
+  const registry = JSON.parse(await readFile(path.join(repository, "server.json"), "utf8"));
+  assert.equal(locked.version, packageJson.version);
+  assert.equal(locked.packages[""].version, packageJson.version);
+  assert.equal(registry.version, packageJson.version);
+  assert.equal(registry.packages[0].version, packageJson.version);
   const cli = path.join(packageRoot, "bin", "cli.js");
   const { stdout: versionOutput } = await execFileAsync(process.execPath, [cli, "--version"]);
   const { stdout: helpOutput } = await execFileAsync(process.execPath, [cli, "--help"]);

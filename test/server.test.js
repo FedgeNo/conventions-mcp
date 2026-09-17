@@ -34,6 +34,10 @@ test("HTTP transport rejects malformed session limits", async () => {
     process.env.MCP_HTTP_MAX_SESSIONS = "10";
     process.env.MCP_HTTP_SESSION_IDLE_MS = "999";
     await assert.rejects(runHTTPServer(), /at least 1000/);
+    process.env.MCP_HTTP_SESSION_IDLE_MS = "2147483648";
+    await assert.rejects(runHTTPServer(), /at most 2147483647/);
+    process.env.MCP_HTTP_SESSION_IDLE_MS = "9007199254740992";
+    await assert.rejects(runHTTPServer(), /at most 2147483647/);
   } finally {
     if (previousMax === undefined) delete process.env.MCP_HTTP_MAX_SESSIONS;
     else process.env.MCP_HTTP_MAX_SESSIONS = previousMax;
