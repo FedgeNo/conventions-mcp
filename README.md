@@ -1,3 +1,7 @@
+> **Superseded — No Longer Maintained**
+>
+> This project has been superseded by the [Cloudflare Worker version of Conventions MCP](https://github.com/FedgeNo/conventions-mcp-cloudflare-worker) and its [companion client](https://github.com/FedgeNo/conventions-mcp-cloudflare-client). Use those repositories for new installations and follow their setup guides to deploy your own server. This original version is no longer maintained.
+
 # conventions-mcp
 
 Personal memory for durable coding conventions and standing instructions — one store, any MCP-compatible AI client, available in every project. It holds rules like "always use 2-space indent in this language," "never force-push to main," lasting corrections, and long-lived workflow preferences that should carry across future sessions rather than get re-explained every time. It is deliberately not a history of individual jobs or a place for task-specific directions, temporary decisions, current status, or one-off commands.
